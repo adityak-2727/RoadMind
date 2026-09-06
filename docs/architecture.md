@@ -82,9 +82,11 @@ trackedAgents = objectTracking(fusedAgents, trackedAgentsPrev, dt)
 ```matlab
 predictedTrajectory = constantVelocityPrediction(agent, horizon, dt)
 % Projects an agent forward assuming constant velocity/heading (cars/buses/trucks).
+% Returns Nx3 [x, y, uncertaintyRadius] - see Phase 2 interface note below.
 
 predictedTrajectory = irregularMotionModel(agent, horizon, dt)
 % Models erratic motion with wider uncertainty (pedestrian/animal/pushcart/bicycle).
+% Returns Nx3 [x, y, uncertaintyRadius], radius growing faster than the constant-velocity model.
 
 predictedTrajectories = trajectoryPrediction(trackedAgents, horizon, dt)
 % Dispatches each tracked agent to the right motion model by agent.class and collects results.
@@ -93,11 +95,14 @@ predictedTrajectories = trajectoryPrediction(trackedAgents, horizon, dt)
 ### 4. Decision (`decision/`)
 
 ```matlab
-behaviorCommand = behaviorDecision(egoState, trackedAgents, predictedTrajectories, decisionState)
-% Maps current context into a high-level behavior intent (cruise/yield/stop/crawl/overtake).
+behaviorCommand = behaviorDecision(egoState, trackedAgents, predictedTrajectories, plannerConfig, decisionState)
+% Maps current context into a high-level behavior intent: "cruise", "yield", or "emergency_stop",
+% by classifying the worst-case calculateTTC() across trackedAgents against plannerConfig.ttcThresholds.
+% plannerConfig added in Phase 4 - see interface note below.
 
 nextState = decisionStateMachine(currentState, behaviorCommand, sensorEvents)
-% Holds the FSM governing high-level behavior transitions, guarded by sensor/perception events.
+% Holds the FSM governing high-level behavior transitions: escalates immediately, de-escalates
+% one severity level per tick so risk clearing doesn't snap the vehicle straight back to full speed.
 ```
 
 ### 5. Planning (`planning/`)
@@ -109,9 +114,10 @@ globalPath = globalPlanner(startPose, goalPose, mapData)
 candidateTrajectories = localPlanner(egoState, globalPath, predictedTrajectories, plannerConfig)
 % Samples a set of candidate short-horizon trajectories around the global path.
 
-selectedTrajectory = adaptivePlanner(egoState, candidateTrajectories, predictedTrajectories, plannerConfig, scenarioContext)
+selectedTrajectory = adaptivePlanner(egoState, candidateTrajectories, predictedTrajectories, vehicleConfig, plannerConfig, scenarioContext)
 % Scores candidates via the weighted cost function and selects the best one.
 % This is where behavior adapts to unstructured-road context (mixed traffic, unmarked lanes).
+% vehicleConfig added in Phase 2 - see interface note below.
 
 [isColliding, minTTC] = collisionCheck(egoTrajectory, predictedTrajectories, vehicleConfig)
 % Checks a candidate ego trajectory against predicted agent trajectories; returns min TTC.
@@ -123,8 +129,9 @@ smoothPath = pathSmoothing(rawPath, smoothingParams)
 ### 6. Control (`control/`)
 
 ```matlab
-controlCommand = vehicleController(egoState, selectedTrajectory, vehicleConfig)
-% Combines lateral + longitudinal control into a single command for the vehicle model.
+controlCommand = vehicleController(egoState, selectedTrajectory, vehicleConfig, targetSpeed)
+% Combines lateral (pure pursuit) + longitudinal (P control to targetSpeed) into a single
+% command for the vehicle model. targetSpeed added in Phase 4 - see interface note below.
 
 steeringAngle = purePursuitController(egoState, path, lookaheadDist, vehicleConfig)
 % Computes steering angle to track a path using pure pursuit geometry.
@@ -177,6 +184,35 @@ scenarioData = highwayMerge()
 scenarioData = marketArea()
 scenarioData = cattleCrossing()
 ```
+
+## Interface change log
+
+Signatures that changed from their original Phase 0 draft once the function
+actually had to do its documented job. Each was made while the function had
+no callers besides `main.m` (also updated each time), so there was no
+breakage to manage - noted here so the reason isn't lost.
+
+**Phase 2** (collision-aware local planning):
+
+- `constantVelocityPrediction`/`irregularMotionModel`/`trajectoryPrediction`
+  return **Nx3** `[x, y, uncertaintyRadius]` instead of Nx2. `collisionCheck`
+  needs a per-timestep safety radius per agent and there was nowhere else to
+  carry it without breaking the "plain matrices, not structs" rule.
+- `adaptivePlanner` gained a `vehicleConfig` parameter. It calls
+  `collisionCheck` internally to reject unsafe candidates, and
+  `collisionCheck` requires `vehicleConfig` - the original draft signature
+  had no way to thread it through.
+
+**Phase 4** (decision layer / speed control):
+
+- `behaviorDecision` gained a `plannerConfig` parameter, needed for
+  `plannerConfig.ttcThresholds` to classify risk into a behavior command.
+- `vehicleController` gained a `targetSpeed` parameter. It previously
+  hardcoded a fixed cruise speed internally, which made it structurally
+  impossible for the vehicle to ever yield or stop - lateral planning alone
+  can't resolve a perpendicular crossing (see `urbanIntersection`'s near-miss
+  in the Phase 3 validation run). The caller (`main.m`) now derives
+  `targetSpeed` from `decisionState` via `behaviorDecision`/`decisionStateMachine`.
 
 ## Toolbox-swap note
 

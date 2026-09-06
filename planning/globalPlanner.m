@@ -1,15 +1,25 @@
 function globalPath = globalPlanner(startPose, goalPose, mapData)
-% globalPlanner - stub: will compute a coarse route from start to goal over
-% the scenario map (e.g. A*/RRT over a lane graph or occupancy grid).
-% Phase 0: no logic yet.
+% globalPlanner - returns the scenario map's centerline as the coarse
+% start-to-goal route when available, falling back to a straight line
+% between start and goal otherwise (e.g. a scenario with no map geometry
+% yet). Phase 5+ can replace the fallback with real A*/RRT over an
+% occupancy grid without changing this function's contract.
 %
 % Inputs:
 %   startPose - [x, y, yaw]
 %   goalPose  - [x, y, yaw]
-%   mapData   - scenario map/road representation (format TBD)
+%   mapData   - scenario map struct with field centerline (Nx2), or []
 % Output:
-%   globalPath - Nx2 array of [x, y] waypoints (placeholder empty)
+%   globalPath - Nx2 array of [x, y] waypoints
 
-globalPath = zeros(0, 2);
+if isstruct(mapData) && isfield(mapData, 'centerline') && ~isempty(mapData.centerline)
+    globalPath = mapData.centerline;
+    return;
+end
+
+numPoints = 50;
+x = linspace(startPose(1), goalPose(1), numPoints)';
+y = linspace(startPose(2), goalPose(2), numPoints)';
+globalPath = [x, y];
 
 end

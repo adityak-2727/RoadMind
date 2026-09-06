@@ -1,18 +1,39 @@
 # SIH 2026 — Problem Statement 26037
 ## Adaptive Path Planning and Collision Avoidance for Autonomous Vehicles on Unstructured Indian Roads
 
-Status: **Phase 2 — five scenarios with real geometry.** The kinematic bicycle
-model, pure pursuit + speed controller (Phase 1), and all five scenarios
-(`villageRoad`, `urbanIntersection`, `highwayMerge`, `marketArea`,
-`cattleCrossing`) now have real road geometry and ground-truth agents. Each
-scenario has been verified in MATLAB: the ego vehicle drives its fixed
-reference path end-to-end and reaches the goal (11.6s-20.2s depending on
-route length). Obstacle avoidance is not wired in yet — the vehicle currently
-drives through agents rather than around them. Perception, prediction,
-decision, and the adaptive/cost-based planner are still stubs (Phase 3+);
-every stub keeps the fixed signature from `docs/architecture.md` so later
-phases (and later swapping in MATLAB Automated Driving Toolbox objects) can
-fill in real logic without breaking callers.
+Status: **Phase 4 — reactive planning + speed-aware decision layer.**
+Prediction, collision checking, and a cost-based adaptive local planner
+(Phase 3) are joined by a real decision layer: `decision/behaviorDecision.m`
+classifies risk (worst-case TTC + proximity across tracked agents) into
+`cruise`/`yield`/`emergency_stop`, and `decisionStateMachine.m` adds
+hysteresis so that classification doesn't flicker. `main.m` now uses the
+resulting state to modulate `vehicleController`'s target speed (plus a
+scenario-appropriate base cruise speed - e.g. market traffic never cruises
+as fast as a highway) - the vehicle can finally slow or stop, not just
+steer. `villageRoad` and `urbanIntersection` also got their missing agent
+types filled in (parked vehicle, pedestrian, motorcycle, auto-rickshaw,
+pothole; a diagonally-merging auto-rickshaw) per the original scenario spec.
+
+Two real bugs turned up building this and are fixed: `irregularMotionModel`
+was growing a fast uncertainty radius for *any* irregular-class agent even
+when stationary (a parked pushcart, a pothole), which made static obstacles
+effectively unavoidable once that radius outgrew the planner's corridor -
+now radius growth is keyed off actual agent speed. And the original
+`PROXIMITY_YIELD_DIST` (5m) was wider than these roads are, so a stopped
+ego next to any roadside static agent could never out-distance the trigger
+and deadlocked permanently - tightened to 2m (a real near-graze distance).
+
+Verified in MATLAB across all five scenarios after both fixes: **all five
+reach goal with no critical TTC events and 2.0m+ clearance throughout**, and
+`urbanIntersection`'s previous near-miss (TTC 0.80s/clearance 0.75m under
+lateral-only avoidance) is resolved (TTC 3.80s/clearance 2.75m) now that the
+vehicle can yield to crossing traffic instead of only swerving.
+
+Camera/LiDAR/radar perception and tracking are still stubs; every stub
+keeps the fixed signature from `docs/architecture.md` (see its "Interface
+change log" for every signature that changed once a function actually had
+to do its documented job) so later phases can fill in real logic without
+breaking callers.
 
 ## Pipeline
 
