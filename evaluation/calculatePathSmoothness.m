@@ -1,12 +1,24 @@
 function smoothnessMetric = calculatePathSmoothness(path)
-% calculatePathSmoothness - stub: will quantify path smoothness (e.g. mean/
-% max curvature, curvature rate) for evaluating ride comfort. Phase 0: no logic yet.
+% calculatePathSmoothness - quantifies path smoothness as the sum of
+% absolute curvature change along the path (heading angle change between
+% consecutive segments, angle-wrapped to avoid spurious jumps at +/-pi).
+% Lower is smoother; 0 for a perfectly straight path.
 %
-% Input:
-%   path - Nx2 array of [x, y] waypoints
+% Inputs:
+%   path - Nx2 array of [x, y] waypoints (e.g. the ego's actual driven
+%          trajectory, or any candidate/planned path)
 % Output:
-%   smoothnessMetric - scalar placeholder (0)
+%   smoothnessMetric - sum(abs(delta curvature)), unitless (radians)
 
-smoothnessMetric = 0;
+if isempty(path) || size(path, 1) < 3
+    smoothnessMetric = 0;
+    return;
+end
+
+heading = atan2(diff(path(:, 2)), diff(path(:, 1)));
+headingChange = diff(heading);
+headingChange = atan2(sin(headingChange), cos(headingChange)); % wrap to [-pi, pi]
+
+smoothnessMetric = sum(abs(headingChange));
 
 end
