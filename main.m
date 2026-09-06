@@ -34,9 +34,9 @@ sensorCfg = sensorConfig();
 rng(simCfg.randomSeed);
 
 %% Select scenario
-scenario = villageRoad();
- %scenario = urbanIntersection();
-%scenario = highwayMerge();
+% scenario = villageRoad();
+% scenario = urbanIntersection();
+scenario = highwayMerge();
 % scenario = marketArea();
 % scenario = cattleCrossing();
 

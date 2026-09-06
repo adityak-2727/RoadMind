@@ -1,9 +1,17 @@
-function [selectedTrajectory, selectedIndex] = adaptivePlanner(egoState, candidateTrajectories, predictedTrajectories, vehicleConfig, plannerConfig, scenarioContext, previousIndex) %#ok<INUSD>
+function [selectedTrajectory, selectedIndex] = adaptivePlanner(egoState, candidateTrajectories, predictedTrajectories, vehicleConfig, plannerConfig, scenarioContext, previousIndex, debugFallback) %#ok<INUSD>
 % adaptivePlanner - scores each candidate trajectory from localPlanner
 % against all six weights in plannerConfig.costWeights and selects the
 % lowest-cost trajectory that clears collisionCheck's TTC-critical
-% threshold; if none clear it, falls back to whichever candidate buys the
-% most time (least-bad emergency choice) rather than returning nothing.
+% threshold; if none clear it, falls back to a feasibility-aware emergency
+% choice (see the fallback block below) rather than returning nothing.
+%
+% debugFallback - optional, default false. When true and the fallback path
+% is taken, prints a per-candidate diagnostic table (minTTC, minClearance,
+% required/max feasible curvature and steering angle, feasible flag,
+% ranking score) so the selected fallback candidate is always explainable.
+% Kept as an optional trailing argument so every existing 7-argument call
+% site is unaffected (same pattern as perception/sensorFusion.m's
+% debugDedup).
 %
 % Cost terms:
 %   collisionRisk      - w.collisionRisk / minTTC (from collisionCheck)
@@ -64,6 +72,7 @@ function [selectedTrajectory, selectedIndex] = adaptivePlanner(egoState, candida
 %   scenarioContext        - scenario-specific hints (road type, density, etc.)
 %   previousIndex          - index selected last step (optional; omit or
 %                            pass [] on the first call, defaults to centerline)
+%   debugFallback          - optional, default false; see above.
 % Outputs:
 %   selectedTrajectory - Nx2 array of chosen [x, y] waypoints
 %   selectedIndex       - the chosen candidate's index, to pass back in as
@@ -82,12 +91,17 @@ w = plannerConfig.costWeights;
 if nargin < 7 || isempty(previousIndex)
     previousIndex = ceil(numCandidates / 2);
 end
+if nargin < 8 || isempty(debugFallback)
+    debugFallback = false;
+end
 
 CONSISTENCY_WEIGHT = 0.3;
 
 costs = zeros(numCandidates, 1);
 minTTCs = Inf(numCandidates, 1);
 isCollidingFlags = false(numCandidates, 1);
+minClearances = Inf(numCandidates, 1);
+curvatures = zeros(numCandidates, 1);
 
 for c = 1:numCandidates
     candidate = candidateTrajectories{c};
@@ -110,6 +124,10 @@ for c = 1:numCandidates
     approxCurvature = maxHeadingChange / max(avgSegLength, 1e-3);
     impliedSafeSpeed = min(vehicleConfig.maxSpeed, sqrt(vehicleConfig.maxAccel / max(approxCurvature, 1e-3)));
 
+    minClearances(c) = minClearance;
+    curvatures(c) = approxCurvature; % same curvature already used for curvatureCost/speedChangeCost above -
+                                      % reused (not recomputed) by the fallback ranking below
+
     riskCost = w.collisionRisk / max(minTTC, 0.1);
     clearanceCost = w.obstacleClearance / max(minClearance, 0.1);
     deviationCost = w.pathDeviation * mean(vecnorm(candidate - centerline, 2, 2));
@@ -126,7 +144,60 @@ if ~isempty(safeIdx)
     [~, bestLocal] = min(costs(safeIdx));
     bestIdx = safeIdx(bestLocal);
 else
-    [~, bestIdx] = max(minTTCs); % no safe candidate: take whichever buys the most time
+    % No candidate clears the safety screen above - this is the existing,
+    % unchanged emergency fallback path (isCollidingFlags/minTTCs/safeIdx
+    % are exactly as before; nothing here can turn a colliding candidate
+    % "safe" or move the critical threshold). The only change from the
+    % previous plain max(minTTCs) rule: among the (still unsafe) candidates,
+    % prefer ones the vehicle can actually steer into given
+    % vehicleConfig.maxSteerAngle/wheelbase, per K2's root-cause finding
+    % that some max-minTTC picks required more curvature than the bicycle
+    % model can produce (up to ~4.96 1/m against a ~0.259 1/m limit).
+    maxFeasibleCurvature = tan(vehicleConfig.maxSteerAngle) / vehicleConfig.wheelbase;
+    isFeasible = curvatures <= maxFeasibleCurvature;
+
+    feasibleIdx = find(isFeasible);
+    if ~isempty(feasibleIdx)
+        % feasible first, then max minTTC, then max clearance as tiebreak -
+        % never invents safety: every candidate here is still the unsafe
+        % set, this only orders which unsafe candidate to ride out.
+        rankKeys = [minTTCs(feasibleIdx), minClearances(feasibleIdx)];
+        [~, order] = sortrows(rankKeys, [-1, -2]);
+        bestIdx = feasibleIdx(order(1));
+    else
+        % No candidate is even kinematically feasible - retain the exact
+        % pre-K2 behavior rather than inventing a new rule (still an
+        % emergency fallback, not a solved situation).
+        [~, bestIdx] = max(minTTCs);
+    end
+
+    if debugFallback
+        requiredSteerDeg = rad2deg(atan(curvatures * vehicleConfig.wheelbase));
+        maxFeasibleSteerDeg = rad2deg(vehicleConfig.maxSteerAngle);
+        % Display-only composite reflecting the actual lexicographic
+        % ranking used above (minTTC primary, minClearance tiebreak) -
+        % selection itself uses sortrows, not this scalar, but a single
+        % number makes the printed ordering easy to eyeball.
+        rankScore = minTTCs * 1e4 + min(minClearances, 1e3);
+        fprintf('[adaptivePlanner fallback] t=%.2f no safe candidate (%d total), %d/%d kinematically feasible\n', ...
+            egoState.timestamp, numCandidates, numel(feasibleIdx), numCandidates);
+        fprintf('  %-4s %-8s %-10s %-12s %-12s %-10s %-12s\n', 'idx', 'minTTC', 'minClr', 'reqCurv', 'reqSteerDeg', 'feasible', 'rankScore');
+        for k = 1:numCandidates
+            if isFeasible(k)
+                feasStr = 'yes';
+            else
+                feasStr = 'no';
+            end
+            if k == bestIdx
+                selMark = '  <- selected';
+            else
+                selMark = '';
+            end
+            fprintf('  %-4d %-8.2f %-10.2f %-12.3f %-12.1f %-10s %-12.1f%s\n', ...
+                k, minTTCs(k), minClearances(k), curvatures(k), requiredSteerDeg(k), feasStr, rankScore(k), selMark);
+        end
+        fprintf('  max feasible curvature=%.3f 1/m, max feasible steering=%.1f deg\n', maxFeasibleCurvature, maxFeasibleSteerDeg);
+    end
 end
 
 selectedTrajectory = candidateTrajectories{bestIdx};
