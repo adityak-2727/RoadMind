@@ -70,6 +70,20 @@ fusedAgents = sensorFusion(cameraAgents, lidarAgents, radarAgents)
 % Associates and merges detections from all sensors into one fused agent list.
 ```
 
+There is no real image/point-cloud/radar-return simulator in this project.
+`image`/`pointCloud`/`radarData` are each the ground-truth agents already
+filtered to that sensor's range/FOV by `main.m`'s `filterAgentsForSensor`
+(main.m plays "the sensor capturing a frame"; these functions play "the
+detector interpreting it"). Each function then genuinely degrades that
+input to mimic its sensor's real characteristics (camera: accurate class,
+noisy position, no velocity; lidar: precise position, no class, no
+velocity; radar: accurate velocity, poor position, no class) using
+`config/sensorConfig.m` (another file not in the original Phase 0 list, same
+justification as `createAgent.m`/`createEgoState.m`). This is simulated
+detection, explicitly labeled as such throughout - never presented as real
+AI detection output, per the project brief's requirement to keep ground
+truth and perception output clearly distinct.
+
 ### 2. Tracking (`perception/objectTracking.m`)
 
 ```matlab
@@ -202,6 +216,22 @@ breakage to manage - noted here so the reason isn't lost.
   `collisionCheck` internally to reject unsafe candidates, and
   `collisionCheck` requires `vehicleConfig` - the original draft signature
   had no way to thread it through.
+
+## Known behavior: decision dwell time lives in main.m, not decisionStateMachine
+
+`decisionStateMachine`'s signature was never changed, but its transitions
+are gated by a minimum dwell time (`MIN_DWELL_TIME`, currently 1.5s) that
+`main.m` enforces around the call, not inside the function itself. Reason:
+`calculateTTC` depends on `egoState.velocity`, and the decision layer sets
+that same velocity via `targetSpeed` - braking hard for `emergency_stop`
+can itself make the very next instant's TTC estimate look briefly safe,
+which without a dwell time flips the state straight back to `yield`,
+re-accelerates, and drops TTC again, oscillating every 0.5-0.9s (observed
+directly in `highwayMerge`). Escalating to more caution is applied
+immediately regardless of dwell time (safety-first); only de-escalating is
+rate-limited. This lives in `main.m` because it is a scheduling/orchestration
+concern about how often to *commit* a transition, not part of what
+transitions are valid - `decisionStateMachine` stays a pure function.
 
 **Phase 4** (decision layer / speed control):
 

@@ -1,8 +1,14 @@
 function scenarioData = cattleCrossing()
 % cattleCrossing - straight rural stretch with a roadside stall and a cow
 % that suddenly crosses the ego's path, meant to drive TTC down sharply
-% and exercise emergency braking/replanning. Phase 2: real geometry +
-% agents, no perception/decision logic yet.
+% and exercise emergency braking/replanning.
+%
+% The cow's velocity is tuned so its road-crossing moment (y: -6 -> 0)
+% lands at roughly t=8s, x=50 - matching where the ego actually is at that
+% time under main.m's default cruise speed for this scenario (verified by
+% simulation, not just geometry: at the previous vy=2.5 the cow crossed
+% and cleared the road by t=3s while the ego was still under 10m in, so
+% the "sudden crossing" never actually coincided with the ego at all).
 %
 % Output:
 %   scenarioData - struct with fields: map, egoStart, egoGoal, agents
@@ -30,8 +36,8 @@ cow = createAgent();
 cow.id = 2;
 cow.class = "animal";
 cow.position = [50, -6.0];
-cow.velocity = [0.5, 2.5]; % suddenly crossing perpendicular to the road near x=50
-cow.heading = atan2(2.5, 0.5);
+cow.velocity = [0.5, 0.75]; % crosses y=0 near t=8s, x~54 - timed to meet the ego, not miss it
+cow.heading = atan2(0.75, 0.5);
 cow.confidence = 1.0;
 cow.source = "fused";
 
