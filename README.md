@@ -1,6 +1,28 @@
 # SIH 2026 — Problem Statement 26037
 ## Adaptive Path Planning and Collision Avoidance for Autonomous Vehicles on Unstructured Indian Roads
 
+## Phase 9 — CARLA ↔ MATLAB ↔ Simulink integration, live-verified
+
+`carlaIntegration/` (Python CARLA adapter, MATLAB adapter functions, a
+Simulink `matlab.System` interface block) and `config/carlaConfig.m`
+were built, then verified end-to-end against a **real, running CARLA
+0.9.16 server** in an isolated Python 3.12 environment (the project's own
+Python 3.13 was never touched): connect, spawn, read real state (position/
+velocity/heading, including a live-data check of the coordinate
+transform), send steer/throttle/brake and observe the vehicle actually
+respond (velocity rising monotonically under throttle, falling under
+brake), drive the same loop through a real Simulink model, and clean up.
+Two real integration-layer bugs were found and fixed along the way (a
+MATLAB System block code-generation restriction, and missing real-time
+simulation pacing against CARLA's async clock) — no autonomy code was
+touched to fix either. This is still an integration **foundation** only —
+no perception/planning/decision logic runs against CARLA yet — and the
+existing MATLAB-only system (`main.m`, `demo/runDemo.m`, the five
+scenarios, K1, K2) remains completely unaffected, reverified with zero
+CARLA dependency (14/14 regression tests, 5/5 scenarios, 0 collisions).
+See [docs/carla_integration.md](docs/carla_integration.md) for the full
+verification evidence and setup instructions.
+
 ## Hardening — villageRoad avoid↔brake oscillation
 
 Root-caused, not a dwell/threshold tuning issue: `behaviorDecision.m`'s

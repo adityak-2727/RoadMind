@@ -2,6 +2,8 @@
 *.autosave
 slprj/
 *.slxc
+__pycache__/
+*.pyc
 
 # Generated per-run logs (results/logs/.gitkeep keeps the folder tracked)
 results/logs/*.csv

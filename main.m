@@ -1,4 +1,5 @@
-% main.m - full closed-loop demo for SIH 26037.
+function metrics = main(scenarioNameOverride, realTimePlotOverride)
+% main - full closed-loop demo for SIH 26037.
 % Wires the full pipeline through the real loop: synthetic camera/lidar/
 % radar detection + fusion + tracking (perception/) feeds prediction,
 % decision (behavior state machine), the six-weight adaptive local planner,
@@ -20,8 +21,36 @@
 % for the full rationale. rng(simCfg.randomSeed) makes every run
 % reproducible despite the sensor noise/missed-detection randomness.
 % See docs/architecture.md for the full pipeline signatures and diagram.
+%
+% Converted from a script to a function so a scenario can be selected
+% programmatically (demo/runDemo.m) instead of only by hand-editing the
+% scenario-selection block below; the defaults below reproduce exactly
+% what this file used to hardcode, so a bare `main` (no arguments) behaves
+% identically to every prior manual run. Nothing about the simulation,
+% planning, prediction, decision, or control logic changed.
+%
+% Inputs (both optional):
+%   scenarioNameOverride - one of "villageRoad", "urbanIntersection",
+%                          "highwayMerge", "marketArea", "cattleCrossing".
+%                          Defaults to "highwayMerge" (the prior hardcoded
+%                          selection).
+%   realTimePlotOverride - true/false. Defaults to true (the prior
+%                          hardcoded simCfg.realTimePlot value).
+% Output:
+%   metrics - struct with fields: scenarioName, goalReached,
+%             completionTime, geometricCollision, minClearance, minTTC,
+%             fallbackCount, pathSmoothness - the same values already
+%             printed/logged below, also returned so a caller (e.g.
+%             demo/runDemo.m) doesn't have to re-parse the log files.
 
-clear; clc;
+if nargin < 1 || isempty(scenarioNameOverride)
+    scenarioNameOverride = "highwayMerge";
+end
+if nargin < 2 || isempty(realTimePlotOverride)
+    realTimePlotOverride = true;
+end
+
+clc;
 
 addpath(genpath(pwd));
 
@@ -34,11 +63,7 @@ sensorCfg = sensorConfig();
 rng(simCfg.randomSeed);
 
 %% Select scenario
-% scenario = villageRoad();
-% scenario = urbanIntersection();
-scenario = highwayMerge();
-% scenario = marketArea();
-% scenario = cattleCrossing();
+scenario = selectScenarioByName(scenarioNameOverride);
 
 %% Initialize state
 egoState = scenario.egoStart;
@@ -95,7 +120,7 @@ decisionSpeedFactors = struct( ...
 );
 
 simCfg.numSteps = 500;
-simCfg.realTimePlot = true;
+simCfg.realTimePlot = realTimePlotOverride;
 
 % Slows the animation for manual review: each 0.1s simulation step gets an
 % extra real-world pause on top of however long drawing the frame took, so
@@ -128,6 +153,7 @@ goalReached = false;
 minTTCObserved = Inf;
 minClearanceObserved = Inf; % measured against ground-truth agent positions, not predictions
 anyUnavoidableCollision = false; % "no safe candidate" flag from adaptivePlanner's fallback, NOT a geometric collision
+fallbackCount = 0; % per-tick count of the same "no safe candidate" event anyUnavoidableCollision flags
 anyGeometricCollision = false;   % actual ego-to-ground-truth-agent distance below contact distance
 CONTACT_DISTANCE = 1.1; % [m] matches collisionCheck.m's egoRadius; a real geometric collision, not a risk flag
 speedTrackingErrors = zeros(simCfg.numSteps, 1);
@@ -218,6 +244,7 @@ for t = 1:steps
     minTTCObserved = min(minTTCObserved, minTTC);
     if isColliding
         anyUnavoidableCollision = true;
+        fallbackCount = fallbackCount + 1;
     end
 
     ttcTrigger = planCfg.replanTriggers.onTTCBelowWarning && ...
@@ -324,6 +351,7 @@ fprintf('Replanning latency: mean=%.2fs median=%.2fs max=%.2fs count=%d\n', ...
     latencyStats.meanLatency, latencyStats.medianLatency, latencyStats.maxLatency, latencyStats.count);
 
 fprintf('State transitions: %d\n', stateTransitionCount);
+fprintf('Fallback count (no-safe-candidate ticks): %d\n', fallbackCount);
 fprintf('Speed tracking error: mean=%.2f m/s max=%.2f m/s\n', mean(speedTrackingErrors), max(speedTrackingErrors));
 fprintf('Max steering command: %.1f deg (limit %.1f deg)\n', rad2deg(maxAbsSteeringCmd), rad2deg(vehCfg.maxSteerAngle));
 fprintf('Max acceleration command: %.2f m/s^2 (limit %.2f)\n', maxAccelCmd, vehCfg.maxAccel);
@@ -342,6 +370,7 @@ if simCfg.logToFile
     fprintf(summaryFile, 'Minimum clearance to any ground-truth agent: %.2f m (contact distance %.2f m)\n', minClearanceObserved, CONTACT_DISTANCE);
     fprintf(summaryFile, 'Geometric collision occurred: %d\n', anyGeometricCollision);
     fprintf(summaryFile, 'No-safe-candidate fallback used at least once (risk flag, not necessarily collision): %d\n', anyUnavoidableCollision);
+    fprintf(summaryFile, 'Fallback count (no-safe-candidate ticks): %d\n', fallbackCount);
     fprintf(summaryFile, 'Path smoothness (sum |delta curvature|): %.2f rad\n', pathSmoothness);
     fprintf(summaryFile, 'Replanning latency: mean=%.2fs median=%.2fs max=%.2fs count=%d\n', ...
         latencyStats.meanLatency, latencyStats.medianLatency, latencyStats.maxLatency, latencyStats.count);
@@ -366,6 +395,19 @@ end
 % metricsReport = evaluateScenario(simLog, scenario);
 % disp(metricsReport);
 
+metrics = struct( ...
+    'scenarioName',       char(scenario.name), ...
+    'goalReached',        goalReached, ...
+    'completionTime',     egoState.timestamp, ...
+    'geometricCollision', anyGeometricCollision, ...
+    'minClearance',       minClearanceObserved, ...
+    'minTTC',             minTTCObserved, ...
+    'fallbackCount',      fallbackCount, ...
+    'pathSmoothness',     pathSmoothness ...
+);
+
+end
+
 function inRangeAgents = filterAgentsForSensor(agents, egoState, maxRange, fov)
 % Selects the ground-truth agents within maxRange and within the fov cone
 % centered on egoState.yaw - i.e. simulates "capturing" one sensor's raw
@@ -383,5 +425,31 @@ for i = 1:numel(agents)
     if abs(bearing) <= fov / 2
         inRangeAgents(end + 1) = agents(i); %#ok<AGROW>
     end
+end
+end
+
+function scenario = selectScenarioByName(name)
+% selectScenarioByName - maps a scenario name string to the corresponding
+% existing scenarios/*.m function call. Defines no scenario content itself
+% - purely a name -> function dispatch so a scenario can be selected
+% programmatically (this file's scenarioNameOverride, or demo/runDemo.m)
+% instead of only by hand-editing a comment block. Rejects an unrecognized
+% name with a clear error rather than silently defaulting to any one
+% scenario.
+name = string(name);
+switch name
+    case "villageRoad"
+        scenario = villageRoad();
+    case "urbanIntersection"
+        scenario = urbanIntersection();
+    case "highwayMerge"
+        scenario = highwayMerge();
+    case "marketArea"
+        scenario = marketArea();
+    case "cattleCrossing"
+        scenario = cattleCrossing();
+    otherwise
+        error('main:invalidScenario', ...
+            '"%s" is not a supported scenario. Supported scenarios: villageRoad, urbanIntersection, highwayMerge, marketArea, cattleCrossing.', name);
 end
 end
