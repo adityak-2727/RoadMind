@@ -1,16 +1,19 @@
-# CARLA ↔ MATLAB ↔ Simulink Integration (Phase 9)
+# CARLA ↔ MATLAB ↔ Simulink Integration (Phase 9 + Phase 10)
 
-This document covers the Phase 9 integration foundation: connecting to
+This document covers the Phase 9 integration foundation (connecting to
 CARLA, spawning one ego vehicle, reading its state, and sending raw control
-commands through both a direct MATLAB path and a Simulink path, isolated
-behind an adapter layer. **Every claim in this document was verified
-against a real, running CARLA server in this session** (not mocked, not
-assumed) - the evidence is below. This does not cover perception,
-prediction, planning, or the five Indian-road scenarios running against
-CARLA - those remain later-phase work. The project's existing MATLAB-only
-system (`main.m`, `demo/runDemo.m`, the five scenarios, K1, K2) is
-completely unaffected and remains runnable with zero CARLA dependency -
-also reverified live in this session (see "Baseline regression" below).
+commands) and Phase 10 (real CARLA camera/LiDAR/radar sensor acquisition,
+delivered into MATLAB in this project's common agent representation).
+**Every claim in this document was verified against a real, running CARLA
+server in this session** (not mocked, not assumed) - the evidence is below.
+This does not cover sensor fusion, tracking, prediction, planning, or
+decision logic driven by CARLA data, or the five Indian-road scenarios
+running against CARLA - those remain later-phase work (Phase 11+). The
+project's existing MATLAB-only system (`main.m`, `demo/runDemo.m`, the five
+scenarios, K1, K2) is completely unaffected and remains runnable with zero
+CARLA dependency - also reverified live in this session (see "Baseline
+regression" below). See "Phase 10 - CARLA Sensor Simulation" further down
+for the sensor-specific documentation.
 
 ## Verified environment
 
@@ -251,9 +254,807 @@ verification completed.
 
 ## What Phase 9 deliberately does NOT include
 
-Camera/LiDAR/Radar perception from CARLA sensors, sensor fusion, tracking,
-prediction, planning, or decision logic driven by CARLA data; the five
-Indian-road scenarios recreated in CARLA; any scripted/pre-recorded
-trajectory presented as autonomous driving; RoadRunner, RL, MPC, SLAM,
-V2X, or ROS integration. All later-phase work, out of scope here by
+Camera/LiDAR/Radar perception from CARLA sensors (added in Phase 10 - see
+below), sensor fusion, tracking, prediction, planning, or decision logic
+driven by CARLA data; the five Indian-road scenarios recreated in CARLA;
+any scripted/pre-recorded trajectory presented as autonomous driving;
+RoadRunner, RL, MPC, SLAM, V2X, or ROS integration. All later-phase work,
+out of scope here by explicit instruction.
+
+---
+
+# Phase 10 - CARLA Sensor Simulation
+
+Extends the Phase 9 `CarlaAdapter`/`CarlaSession` classes (no second
+connection layer) with real CARLA RGB camera, LiDAR, and radar sensor
+acquisition, plus simulator-grounded actor/class metadata, converted into
+this project's existing common agent representation
+(`config/createAgent.m`). Sensor-interface scope only: no sensor fusion, no
+tracking, no connection into the planner/decision stack (all Phase 11).
+The ego vehicle is still only ever driven via `carlaApplyControl` - never
+CARLA autopilot/Traffic Manager/a scripted trajectory; CARLA is only used
+here to provide surrounding actors and sensor data for testing.
+
+## What exists after Phase 10
+
+```
+carlaIntegration/
+    python/
+        carla_adapter.py                  - EXTENDED (not duplicated):
+            attach_camera/_on_camera_image/get_camera_frame
+            attach_lidar/_on_lidar_measurement/get_lidar_points
+            attach_radar/_on_radar_measurement/get_radar_detections
+            get_nearby_actor_objects        - simulator ground truth,
+                                               NOT an image detector (see
+                                               its docstring)
+            spawn_actor_relative_to_ego / set_actor_target_velocity /
+            get_actor_state / destroy_other_actors
+                                             - validation-scene / coordinate
+                                               -check helpers (non-ego only)
+            destroy_sensors                 - stop+destroy camera/lidar/radar
+            disconnect()                    - now also calls
+                                               destroy_sensors()/
+                                               destroy_other_actors()
+    matlab/
+        CarlaSession.m                    - EXTENDED: attachCamera/attachLidar/
+                                             attachRadar/getCameraFrame/
+                                             getLidarPoints/getRadarDetections/
+                                             getNearbyActorObjects/
+                                             spawnActorRelativeToEgo/
+                                             setActorTargetVelocity/getActorState
+        carlaAttachCamera.m / carlaAttachLidar.m / carlaAttachRadar.m
+        carlaGetCameraFrame.m / carlaGetLidarPoints.m / carlaGetRadarDetections.m
+        carlaGetNearbyActorObjects.m       - free-function wrappers, matching
+                                             the existing one-function-per-file
+                                             convention (carlaApplyControl.m etc.)
+        carlaCoordToProject.m / carlaYawToProject.m
+                                           - sensor-data coordinate helper,
+                                             reuses (does not duplicate)
+                                             carlaToProjectState.m's verified
+                                             left-handed -> right-handed mirror
+        carlaLidarPointsToAgents.m        - ground filter + greedy clustering
+                                             -> createAgent()-schema agents,
+                                             class="unknown" always
+        carlaRadarToAgents.m              - spherical->Cartesian + radial-
+                                             velocity projection ->
+                                             createAgent()-schema agents,
+                                             class="unknown" always
+        carlaActorObjectsToAgents.m       - simulator ground-truth actor
+                                             metadata -> createAgent()-schema
+                                             agents, source="carla_ground_truth"
+                                             (never "camera" - see honesty
+                                             note below)
+        carlaSpawnActorRelativeToEgo.m / carlaSetActorTargetVelocity.m /
+        carlaGetActorState.m              - validation-scene / coordinate-
+                                             check wrappers (non-ego actors only)
+        carlaSensorValidationDemo.m       - evidence visualization (camera +
+                                             LiDAR top-down + radar top-down +
+                                             CONNECTED status), see below
+    tests/
+        testCarlaSensors.m                 - 9 live-CARLA sensor tests (camera/
+                                              LiDAR/radar acquisition, camera-only/
+                                              LiDAR-only robustness, missing/
+                                              duplicate-observation robustness,
+                                              coordinate-transform verification,
+                                              sensor-lifecycle/orphan-actor check)
+config/
+    carlaConfig.m                          - EXTENDED: cfg.camera / cfg.lidar /
+                                              cfg.radar sub-configs (mount pose,
+                                              resolution/FOV, channels/range/
+                                              points-per-second, etc.)
+```
+
+## Honesty note: `carlaActorObjectsToAgents` is NOT an image-based detector
+
+Phase 10's camera requirement includes "object/class information where
+available." No trained CV detector was built for this phase (out of the P0
+scope agreed for Phase 10). Instead, `get_nearby_actor_objects()`
+(Python) / `carlaGetNearbyActorObjects.m` / `carlaActorObjectsToAgents.m`
+read CARLA's own simulator-grounded ground truth for nearby vehicle/
+pedestrian actors (true position, velocity, heading, class) - CARLA already
+knows this to render them. This is explicitly documented, in the code and
+here, as **simulator ground truth, not an RGB-image-based detector** - its
+agents use `source = "carla_ground_truth"`, deliberately never `"camera"`,
+so nothing downstream could mistake it for vision-based perception.
+
+## Live verification evidence (Phase 10)
+
+All of the following were run against a live CARLA 0.9.16 server
+(`Town10HD_Opt`, headless) in this session - not mocked, not assumed.
+
+### Camera / LiDAR / radar acquisition (real data)
+```
+CAMERA: OK size=480x640x3 frame#=116264 t=1077.283
+LIDAR:  OK numPoints=605  frame#=116272 t=1077.393  -> 6 clusters
+RADAR:  OK numDetections=10 frame#=116276 t=1077.460 -> 10 agents
+```
+Camera image reconstructed as an HxWx3 `uint8` RGB array (byte-exact
+against the raw BGRA->RGB conversion done in `carla_adapter.py`). LiDAR/
+radar reconstructed via `typecast(uint8(pyBytesObject), 'single')` -
+byte-exact against a Python-side length check before the MATLAB call.
+
+### Coordinate-transform verification (real data, live server)
+Ego at project-frame `x=-64.64 y=-24.47 yaw=-0.003 rad`. Actors spawned at
+known offsets relative to the ego's *current* transform, then read back and
+converted via `carlaCoordToProject`/rotated into the ego's local frame:
+
+| Spawn offset (fwd, right) | Expected local (fwd, lat) | Measured local (fwd, lat) |
+|---|---|---|
+| (10, 0) "ahead" | (~10, ~0) | (10.00, 0.00) |
+| (0, 5) "right" | (~0, ~-5) | (-0.00, -5.00) |
+| (0, -3) "left" | (~0, ~+3) | (-0.00, 3.00) |
+| (15, 0) + vx=5 m/s "moving away" | fwd growing past 15 | 16.04 (after a 0.3s settle - consistent with 5 m/s motion) |
+
+Confirms: CARLA's "right" maps to project-frame **negative** lateral
+(`carlaCoordToProject`'s y-mirror), "left" to **positive** - the exact
+mirror-image relationship the y-flip formula predicts - and a real applied
+velocity is reflected in the position readback. Also captured as
+`testCoordinateTransformAheadAndRight` in `testCarlaSensors.m` (passes
+live).
+
+### Validation scene - multiple actor types (real spawn, real classification)
+Spawned via `carlaSpawnActorRelativeToEgo`, then read back through
+`carlaGetNearbyActorObjects`/`carlaActorObjectsToAgents`:
+
+| Requested | Blueprint used | Classified as | Note |
+|---|---|---|---|
+| car | `vehicle.audi.tt` | `car` | exact |
+| truck | `vehicle.carlamotors.carlacola` | `truck` | exact (base_type attribute) |
+| motorcycle | `vehicle.harley-davidson.low_rider` | `motorcycle` | exact |
+| pedestrian | `walker.pedestrian.0001` | `pedestrian` | exact |
+| bicycle | `vehicle.bh.crossbike` | `motorcycle` | **known limitation** - CARLA has no distinct blueprint category for "auto-rickshaw"/"pushcart"/true bicycle-vs-motorcycle; `classify()`'s wheel-count heuristic (2/3 wheels -> "motorcycle") cannot tell a pedal bicycle from a motorbike. Documented, not silently misreported - see Known limitations. |
+
+No fabricated classes: every class above came from CARLA's own blueprint/
+attribute metadata, never invented.
+
+### Sensor lifecycle / orphan-actor cleanup (independently verified)
+Spawned ego + camera + LiDAR + radar + 1 test actor, let data flow, then
+`carlaDisconnect()`. An **independent, fresh** `py.carla.Client` query
+(bypassing `CarlaSession` entirely) confirmed **0 sensor actors, 0 vehicle
+actors** remained - both in ad hoc development testing and as the
+automated `testSensorLifecycleNoOrphanActors` test (passes live). Two real
+orphan incidents were hit and fixed during development: a Python-layer
+crash (missing `numpy` in the CARLA venv) left 4 actors behind once,
+diagnosed and cleaned via an independent client query - directly
+motivating the automated independent-query test rather than trusting
+`CarlaSession`'s own bookkeeping.
+
+### Robustness tests (sensor interface only, 9/9 pass live)
+`testCarlaSensors.m`: camera/LiDAR/radar real-data acquisition (3),
+camera-only and LiDAR-only standalone attach (2), missing-observation
+(getter called before first async callback fires -> `[]`, never an error)
+(1), duplicate-observation (reading the same sensor twice back-to-back
+returns the same frame number, never errors or silently advances) (1),
+coordinate-transform verification (1), sensor-lifecycle/orphan-check (1).
+
+### Evidence visualization
+`carlaSensorValidationDemo(numFrames, savePngPath)` connects, spawns the
+5-actor validation scene, and renders camera image / LiDAR top-down /
+radar top-down / `CONNECTED` status + frame/timestamp, refreshed each
+iteration. A real run's snapshot is saved at
+`results/figures/phase10_sensor_validation.png` (shows the real spawned
+Audi TT + Coca-Cola delivery truck in-frame, real LiDAR points clustered
+near/around the ego, real (sparser) radar detections, and all three
+sensors reporting `CONNECTED` with a real frame number/timestamp).
+
+### Regression re-verification after Phase 10 changes
+- `testCarlaSensors.m`: **9/9 passed** (live CARLA).
+- `testCarlaIntegration.m` (Phase 9, unmodified): **6/6 still passed**
+  (confirms extending `CarlaAdapter`/`CarlaSession` did not break the
+  Phase 9 control-channel tests).
+- `tests/testCollisionCheck.m` / `testPlanner.m` / `testPrediction.m`:
+  **14/14 passed, 0 failed** (no CARLA dependency).
+- All five scenarios via `main(name, false)`: **5/5 goal reached, 0/5
+  geometric collisions** - identical to the pre-Phase-10 baseline.
+- `git diff` confirmed empty for every frozen file: K1
+  (`prediction/trajectoryPrediction.m`), K2 (`planning/adaptivePlanner.m`),
+  `planning/collisionCheck.m`, `decision/`, `control/`, `perception/*.m`
+  (the synthetic sensor pipeline used by the five MATLAB scenarios),
+  `scenarios/`, `simulink/AutonomyPipelineBlock.m`,
+  `testCarlaIntegration.m`, and every Phase 9 `carlaIntegration/matlab/*.m`
+  file (`carlaToProjectState.m`, `carlaConnect.m`, `carlaSpawnEgoVehicle.m`,
+  `carlaGetEgoState.m`, `carlaApplyControl.m`, `carlaDisconnect.m`,
+  `getCarlaSession.m`, `isCarlaAvailable.m`).
+
+## Sensor configuration (`config/carlaConfig.m`)
+
+```matlab
+cfg.camera = struct('width',640,'height',480,'fov',90.0, ...
+    'mountX',1.5,'mountY',0.0,'mountZ',2.0,'mountPitch',0,'mountYaw',0,'mountRoll',0);
+cfg.lidar  = struct('channels',32,'range',50.0,'pointsPerSecond',100000, ...
+    'rotationFrequency',10.0,'upperFov',10.0,'lowerFov',-30.0, ...
+    'mountX',0.0,'mountY',0.0,'mountZ',2.2,'mountPitch',0,'mountYaw',0,'mountRoll',0);
+cfg.radar  = struct('horizontalFov',30.0,'verticalFov',10.0,'range',70.0, ...
+    'pointsPerSecond',1500,'mountX',2.0,'mountY',0.0,'mountZ',1.0, ...
+    'mountPitch',0,'mountYaw',0,'mountRoll',0);
+```
+Mount pose is in the vehicle's own local frame (x=forward, y=right, z=up,
+meters; pitch/yaw/roll degrees) - CARLA's own `attach_to` convention.
+Values are reasonable, laptop-friendly defaults, not tuned against a
+specific sensor spec sheet.
+
+## Timestamps and frame synchronization
+
+Every sensor getter (`carlaGetCameraFrame`/`carlaGetLidarPoints`/
+`carlaGetRadarDetections`/`carlaGetNearbyActorObjects`) returns its own
+`.frame` (CARLA simulation frame number) and `.timestamp` (CARLA
+simulation seconds) alongside the data. Each of the three agent converters
+stamps every emitted agent with **that same struct's own timestamp** (not
+a caller-supplied value) - so an agent's timestamp always traces back to
+the exact sweep/frame it was derived from, and nothing silently mixes data
+from two different frames. `get_nearby_actor_objects` originally omitted
+frame/timestamp (an early gap, found and fixed before the final test pass)
+- it now returns them from the same `world.get_snapshot()` call used for
+the ego state.
+
+## Performance approach
+
+Per Phase 10's explicit "reliability > optimization" guidance: each sensor
+keeps only its single latest frame (`sensor.listen(callback)` overwrites a
+one-slot buffer - no unbounded queue growth); MATLAB polls rather than
+blocks; large arrays (camera/LiDAR/radar) cross the `py.*` boundary via
+`.tobytes()` + `typecast`, not element-by-element conversion (the slow
+path); LiDAR clustering deterministically downsamples sweeps above 3000
+points before clustering, purely as a reliability safeguard against a
+pathologically slow pass, not as an accuracy feature. No further
+performance tuning was attempted - this was not a focus area.
+
+## Known limitations (Phase 10)
+
+- **LiDAR clustering includes static-world geometry.** The ground filter
+  only removes points near the road surface; it does not distinguish
+  traffic actors from buildings/poles/curbs/foliage, so clusters can
+  include non-traffic obstacles (visible in the sensor-validation
+  snapshot as extra clusters further from the ego). A real
+  obstacle-vs-background classifier is deferred to a later phase - the
+  Phase 10 spec explicitly asked for "minimum necessary" clustering, not
+  an over-engineered stack.
+- **`classify()`'s wheel-count heuristic cannot distinguish a motorcycle
+  from a pedal bicycle** (both 2-wheeled) - CARLA's `vehicle.bh.crossbike`
+  is reported as `motorcycle`. No CARLA blueprint exists for an
+  auto-rickshaw or pushcart either; per the Phase 10 instruction, no class
+  was fabricated for these - a representative substitute (motorcycle/
+  bicycle-class vehicle) was used and is documented here, not silently
+  presented as an exact match.
+- **Radar velocity is 1D (radial) projected onto a known bearing**, not a
+  true 2D velocity estimate - radar physically cannot observe lateral
+  velocity from a single detection. Documented in
+  `carlaRadarToAgents.m`'s header.
+- **CARLA ground-truth actor confidence is fixed at 1.0** - appropriate for
+  exact simulator state, but this means `carla_ground_truth` agents are
+  not directly comparable to the synthetic pipeline's noisy
+  `confidence` values without accounting for that difference.
+- Sensor fusion (combining camera/LiDAR/radar/ground-truth agents for one
+  physical object), tracking, and any connection into the
+  perception -> prediction -> planning -> decision -> control chain are
+  explicitly Phase 11, not attempted here.
+- Verified against one map (`Town10HD_Opt`) and the sensor defaults in
+  `config/carlaConfig.m`'s Phase 10 sub-configs - other maps/sensor
+  parameter combinations are expected to work identically (same API) but
+  were not individually exercised.
+
+## What Phase 10 deliberately does NOT include
+
+Sensor fusion, object tracking across frames, a trained image-based object
+detector, connecting any sensor into `perception/`, `prediction/`,
+`planning/`, `decision/`, or `control/` (the existing five-scenario
+pipeline is untouched and still runs on its own synthetic sensors), the
+five Indian-road scenarios recreated in CARLA, CARLA autopilot/Traffic
+Manager driving the ego, or any performance optimization beyond the
+reliability safeguards noted above. All later-phase work (Phase 11 -
+MATLAB Perception + Sensor Fusion, and beyond), out of scope here by
 explicit instruction.
+
+---
+
+# Phase 11 - MATLAB Perception + Sensor Fusion
+
+Builds the CARLA-sensors -> unified-agents pipeline on top of the frozen
+Phase 10 sensor acquisition: time synchronization, coordinate
+transformation, multi-sensor association, duplicate suppression,
+confidence/uncertainty, and a unified fused-agent representation. Stops at
+unified agents - tracking and trajectory prediction are Phase 12, not
+attempted here.
+
+## Audit finding that shaped this phase
+
+Before writing anything, the existing `perception/` directory was
+inspected. **`perception/sensorFusion.m` already implements almost
+exactly what Phase 11 asked for**: camera-anchored nearest-neighbour
+association with a documented distance gate, plus a hardened duplicate-
+suppression pass (class-compatibility guard, velocity gating, and
+history-corroboration for ambiguous unknown<->known merges - complete
+with its own measured-noise derivation of its gating distance). It was
+built for the synthetic five-scenario pipeline, but its input contract
+(three `createAgent()` arrays) is exactly what the Phase 10 converters
+already produce. Phase 11 therefore **reuses it unmodified** rather than
+reimplementing association/dedup - `carlaPerceptionStep.m` calls it
+directly, passing CARLA-grounded ground truth into its "camera" slot
+(class), LiDAR into its "lidar" slot (position), and radar into its
+"radar" slot (velocity), then relabels the slot names back to the actual
+CARLA stream that filled them. `perception/objectTracking.m` (Kalman
+tracking + persistent ids) was also inspected and is the natural Phase 12
+starting point, but is intentionally not invoked yet - Phase 11 stops at
+unified agents.
+
+## What exists after Phase 11
+
+```
+config/
+    carlaPerceptionConfig.m   - Phase 11 tunables: syncToleranceSeconds
+                                (MEASURED, see derivation below),
+                                actorQueryToleranceSeconds,
+                                staleTimeoutSeconds, identityGateMeters,
+                                maxSensorRangeMeters, confidence ladder,
+                                nominal per-sensor position std
+    createFusedAgent.m        - unified agent schema: a STRICT SUPERSET of
+                                config/createAgent.m (every base field kept
+                                unchanged), adding acceleration, dimensions,
+                                sources[], uncertainty, behavior,
+                                simulatorActorId, identitySource, syncFrame,
+                                syncMaxOffset
+carlaIntegration/matlab/
+    carlaGetSynchronizedObservations.m
+                              - polls camera/LiDAR/radar/actor-metadata,
+                                picks the newest SENSOR timestamp as the
+                                reference instant, classifies every stream
+                                in_sync / stale / missing
+    carlaPerceptionStep.m     - main Phase 11 entry point: sync -> common-
+                                frame transform -> perception/sensorFusion.m
+                                (REUSED, unmodified) -> confidence/
+                                uncertainty -> identity recovery -> unified
+                                agents
+    carlaPerceptionDemo.m     - evidence visualization: camera + top-down
+                                raw observations vs fused agents, counts,
+                                CONNECTED status
+carlaIntegration/tests/
+    testCarlaPerceptionFusion.m - 12 tests (6 live-CARLA, 6 pure-logic),
+                                all pass
+```
+
+## Time synchronization - the tolerance was MEASURED, not guessed
+
+60 live polls against CARLA 0.9.16 (Town10HD_Opt) with the Phase 10
+default sensor config:
+
+| Metric | Measured |
+|---|---|
+| 3-sensor (camera/LiDAR/radar) timestamp spread | mean 0.032s, median 0.034s, p90 0.037s, p99 0.097s, max 0.103s |
+| Per-sensor update interval | camera/LiDAR/radar all ~0.063s (~16 Hz) |
+| LiDAR<->radar coupling | mean 0.001s (tick together) |
+
+`syncToleranceSeconds = 0.075s` was chosen because it sits above the
+measured p90 (0.037s, so most polls pass) and below the measured
+p99/max (0.097-0.103s, so a genuine anomaly still gets flagged) and is
+about one sensor update period (below that, "the same instant" cannot be
+resolved at all for this sensor set). At 15 m/s relative speed, 0.075s
+is ~1.1m of position disagreement - inside `sensorFusion.m`'s 2.5m
+association gate, so an in-tolerance offset cannot by itself break
+association. Full derivation with all numbers in
+`config/carlaPerceptionConfig.m`'s header.
+
+**A real bug was found and fixed while building this**: an early version
+used the CARLA-grounded actor-metadata query's own timestamp as the
+reference instant. That query is answered "now" whenever MATLAB asks, so
+it does not carry a real observation instant the way the three async
+sensors do - using it as the reference systematically penalised the real
+sensors by the ~0.28-0.40s cost of pulling a frame/point-cloud/radar
+sweep across the `py.*` boundary, marking **all three real sensors stale
+on every tick** and leaving fusion running on ground truth alone (a
+direct violation of the Phase 11 acceptance requirement). Root-caused via
+a dedicated timing diagnostic script, then fixed: the reference instant
+now comes from the async sensors only; the actor-metadata stream gets its
+own, deliberately looser `actorQueryToleranceSeconds` (0.6s) and is
+first-order motion-compensated to the reference instant using each
+actor's own reported velocity (`compensateActorMotion` in
+`carlaPerceptionStep.m`) before being fused, rather than silently allowed
+a larger raw position error. Verified after the fix: all four streams
+report `in_sync` on live runs, with measured offsets of 0.00-0.10s.
+
+## Coordinate transformation - the other real bug found and fixed
+
+The three streams do **not** natively share a frame:
+- LiDAR clusters and radar detections are **sensor-local** (origin at the
+  sensor's own mount point).
+- CARLA-grounded actor metadata is in **CARLA world coordinates**.
+
+An early version fused them without reconciling this and could never
+associate a LiDAR cluster with the ground-truth actor it came from
+(different origins, non-comparable numbers). Fixed by normalising
+everything to one **ego-relative project frame** before fusion:
+- LiDAR/radar: shift by the sensor's known mount offset
+  (`shiftSensorLocalToEgoFrame`, using `config/carlaConfig.m`'s
+  `cfg.lidar`/`cfg.radar` mount pose - the same mount convention Phase 10
+  already verified).
+- Actor metadata: full world -> ego-relative rotation using the ego's own
+  state (`worldToEgoFrame`), reusing the verified Phase 10 handedness
+  convention (`carlaCoordToProject`/`carlaYawToProject`) rather than
+  introducing a second convention.
+
+Live verification after the fix: a car spawned at ego-relative
+(fwd=10, right=-3) was recovered by the fused pipeline at project-frame
+position (10.00, 3.00) - exact, confirming LiDAR/radar/ground-truth all
+now land in the same frame. (Ahead/left/right/moving coordinate checks
+themselves were already verified in Phase 10 and are not re-derived here
+- Phase 11 reuses that verified transform.)
+
+## Multi-sensor association and duplicate suppression
+
+**Not reimplemented** - `perception/sensorFusion.m` is called unmodified
+(see "Audit finding" above). `carlaPerceptionStep.m` additionally threads
+the *previous tick's* fused agents into `sensorFusion.m`'s existing
+`trackedAgentsPrev` corroboration argument. Live evidence this matters: on
+the very first tick (no history yet), a spawned truck produced 2 fused
+objects - `sensorFusion.m`'s own documented policy is "if uncertain
+whether two nearby detections are the same object, keep them separate,"
+which is exactly what happened. By the second tick, with one frame of
+history available, the truck (and every other spawned actor) resolved to
+exactly one fused object each, and stayed that way. This is the intended,
+documented conservative behaviour, not a bug - the alternative
+(guessing) would risk wrongly merging two genuinely distinct nearby
+objects.
+
+## Confidence and uncertainty
+
+Confidence: a simple, transparent, documented ladder by contributing
+sensor count - `config/carlaPerceptionConfig.m`'s
+`confidenceBySourceCount = [0.50, 0.75, 0.90]`. Not a probabilistic
+claim, not fitted to data - stated as a heuristic on the field itself.
+
+Uncertainty (`agent.uncertainty`):
+- `.positionStd` - the nominal 1-sigma of the *best* contributing sensor
+  (engineering estimates in `carlaPerceptionConfig.m`, explicitly labelled
+  as not calibrated).
+- `.sensorDisagreement` - **measured, not estimated**: the actual max
+  distance between what the contributing sensors themselves reported for
+  this object. Live example: a car fused from ground-truth+radar showed
+  `disagree=1.68m` and `disagree=1.90m` for a truck - real numbers coming
+  from real sensor noise, not fabricated.
+
+## Track continuity (foundation only - not Phase 12's tracking)
+
+`agent.id` + `agent.identitySource` distinguish two cases explicitly:
+- `"carla_actor_id"` - the fused object was re-associated (nearest
+  position within `identityGateMeters`) back to a specific CARLA actor;
+  `id` is that actor's real CARLA id. Stable because **CARLA guarantees
+  it**, not because any tracking algorithm established it.
+- `"local_sequential"` - no CARLA actor could be matched (e.g. a LiDAR
+  cluster on a building); `id` is only a sequential number assigned this
+  call, valid for this tick only.
+This distinction is deliberate: a simulator actor id must never be
+presented as a perception-generated track id. `perception/objectTracking.m`
+(Kalman filter + persistent ids, already implemented for the synthetic
+pipeline) is the natural Phase 12 starting point and is left untouched.
+
+## Live CARLA validation evidence
+
+All against a real running CARLA 0.9.16 server, `Town10HD_Opt`:
+
+**One actor -> one fused object** (`testOneActorProducesOneFusedObject`,
+passes live): a single spawned car produced exactly 1 fused object after
+history stabilised, sourced `carla_ground_truth+carla_lidar+carla_radar`.
+
+**Two nearby actors -> two distinct fused objects**
+(`testTwoNearbyObjectsStayDistinct`, passes live): two cars spawned 4m
+apart (ego-relative offsets (15,-2) and (15,2)) remained two separate
+fused objects with distinct ids across every tick, once history existed.
+
+**Validation scene** (car/truck/motorcycle/pedestrian/bicycle, same
+representative-substitute blueprints as Phase 10 - see its documented
+class-heuristic limitation, unchanged): all 5 actors, plus the 2 nearby
+actors, each produced exactly one fused object with correct class,
+confidence 0.90 where LiDAR+radar corroborated the ground truth and 0.50
+where only ground truth was in sync that tick. Snapshot saved at
+`results/figures/phase11_perception_fusion.png` (shows the real camera
+frame alongside the top-down view: grey ground-truth markers, blue LiDAR
+points, red radar x's, green circles for the final fused agents labelled
+with id/class/confidence - and several `unknown`-class LiDAR/radar-only
+clusters further from the ego, honestly representing static world
+geometry rather than hiding it).
+
+## Robustness tests (12/12 pass, `testCarlaPerceptionFusion.m`)
+
+Live: normal 3-sensor fusion, camera-only (ground-truth-only, no
+LiDAR/radar attached), LiDAR-only, radar-only, two-nearby-objects,
+one-actor-one-object, missing-observation (no sensors + no nearby
+actors -> zero fused agents, no error). Logic (no CARLA needed, since
+this is deterministic gating code): sync-tolerance boundary
+classification, all-streams-missing handling, the `createFusedAgent`
+superset guarantee, confidence-ladder monotonicity, and a direct proof
+that `sensorFusion.m`'s own dedup (not new Phase 11 code) merges two
+close same-class agents.
+
+## Regression re-verification after Phase 11
+
+- `testCarlaPerceptionFusion.m` (Phase 11, new): **12/12 passed** (live CARLA).
+- `testCarlaIntegration.m` (Phase 9, unmodified): **6/6 still passed**.
+- `testCarlaSensors.m` (Phase 10, unmodified): **9/9 still passed**.
+- `tests/testCollisionCheck.m` / `testPlanner.m` / `testPrediction.m`:
+  **14/14 passed** (no CARLA dependency).
+- All five scenarios via `main(name, false)`: **5/5 goal reached, 0/5
+  geometric collisions** - identical to the pre-Phase-11 baseline.
+- `git diff` confirmed **empty** for every frozen file: K1
+  (`prediction/trajectoryPrediction.m`), K2 (`planning/adaptivePlanner.m`),
+  `planning/collisionCheck.m`, `decision/`, `control/`, ALL of
+  `perception/` including `sensorFusion.m` and `objectTracking.m` (reused,
+  never modified), `scenarios/`, `simulink/`, `config/createAgent.m`,
+  `testCarlaIntegration.m`, `testCarlaSensors.m`, and every Phase 9/10
+  `carlaIntegration/matlab/*.m` file.
+
+## Known limitations (Phase 11)
+
+- **First-tick duplicates until history exists** - documented behaviour
+  of the reused `sensorFusion.m`, not a defect; resolves within one tick
+  once `previousFusedAgents` is threaded through (as
+  `carlaPerceptionDemo.m` and the tests both do).
+- **Sensor mount rotation is not applied** - `shiftSensorLocalToEgoFrame`
+  only translates by the mount offset; a non-zero `mountYaw` (Phase 10's
+  defaults are all 0) would additionally require rotating sensor-local
+  points, which was deliberately left undone rather than done incorrectly.
+- **History corroboration uses the previous tick's positions as-is** -
+  correct while the ego is stationary (the Phase 11 validation scene);
+  under ego motion the previous tick's ego-relative positions drift
+  relative to the current frame before being compared, which only makes
+  `sensorFusion.m`'s dedup *more* conservative (never wrongly permissive).
+  Proper frame-consistent history is Phase 12 tracking's job.
+- **Actor-metadata motion compensation is first-order** (position +=
+  velocity x dt) - exact for constant velocity, leaves a second-order
+  (acceleration) residual over the sub-second gap being compensated.
+- Inherits Phase 10's known limitations unchanged: LiDAR clustering
+  cannot separate traffic actors from static world geometry (visible as
+  the `unknown`-class clusters far from the ego in the evidence
+  snapshot); ~~the 2-wheel classify() heuristic cannot distinguish
+  motorcycle from bicycle~~ **FIXED in Phase 11.5** - see its section
+  below; radar velocity is a 1D radial projection.
+- `agent.acceleration` is deliberately left `[]` - none of the three
+  sensors observes it directly in a single frame, and differentiating a
+  single frame's velocity would be fabrication.
+- `agent.behavior` is deliberately left `"unknown"` -
+  `prediction/classifyBehavior.m` already owns behaviour classification
+  for the MATLAB pipeline; Phase 11 does not duplicate or connect to it.
+
+## What Phase 11 deliberately does NOT include
+
+Tracking across frames (Kalman-filtered persistent identity beyond CARLA's
+own actor id - `perception/objectTracking.m` exists and is the intended
+Phase 12 starting point, not invoked here), trajectory prediction,
+behaviour classification, connecting fused agents into K1/K2/collision
+checking/decision/control, sensor-mount-rotation handling, a trained
+image-based detector, and the five Indian-road scenarios recreated in
+CARLA. All later-phase work (Phase 12 - Tracking + Trajectory Prediction,
+and beyond), out of scope here by explicit instruction.
+
+---
+
+# Phase 11.5 - Indian Urban Hero Environment
+
+Builds ONE high-fidelity Indian-representative CARLA environment (a large
+4-way unsignalized intersection) as the primary jury-demo scene, in
+response to evaluator feedback that the previous generic Town10 street
+segment did not read as representative of Indian roads. Environment only
+- the frozen autonomy stack (K1, K2, `collisionCheck.m`,
+`behaviorDecision.m`, `decisionStateMachine.m`, `objectTracking.m`,
+`sensorFusion.m`, `localPlanner.m`, `purePursuitController.m`,
+`vehicleController.m`) is **unmodified**, confirmed by `git diff` showing
+zero changes to any of them after this phase.
+
+## Map/intersection selection
+
+CARLA 0.9.16 ships no Indian-authored map. Every stock town
+(`Town01/02/03/04/05` + `_Opt`, `Town10HD(_Opt)` - confirmed via
+`client.get_available_maps()`) was built for a generic Western setting.
+**Town03** was selected purely on intersection geometry: live topology
+analysis (`carla.Map.get_topology()` / `.get_junction().bounding_box`)
+found Town03's junction id=103 has a ~40m bounding extent with 4
+genuinely separated approach directions (bearings -124.8°/178.1°/86.3°/
+-8.3° from its center), the largest true 4-way of any stock town (next
+largest, Town01, tops out ~23m). Every actor's position below was walked
+along that junction's REAL road waypoints via `waypoint.previous(distance)`
+(follows actual spline curvature), not hand-computed straight lines.
+
+## Honest limitation: lane markings cannot be removed
+
+Confirmed live: `carla.MapLayer`'s only members are `NONE, Buildings,
+Decals, Foliage, Ground, ParkedVehicles, Particles, Props, StreetLights,
+Walls, All` - there is no `RoadMarkings` layer, and CARLA 0.9.16's Python
+API has no other mechanism to strip painted lane markings from a stock
+town's baked road mesh (that would require a custom OpenDRIVE map, out of
+scope). This is stated plainly rather than worked around: what the
+requirement is actually protecting against - the autonomy stack depending
+on lane geometry - is fully satisfied regardless, since no file in
+`perception/`, `prediction/`, `planning/`, `decision/`, or `control/` has
+ever read or assumed lane markings, across every phase of this project.
+
+## Traffic lights - unsignalized by construction, not by omission
+
+`carlaFreezeTrafficLights.m` freezes every real CARLA traffic light near
+the junction to a fixed amber state (visible infrastructure, never an
+active red/green cycle) - confirmed live, 6 lights frozen at this
+junction. This is a visual-honesty step only: `decision/behaviorDecision.m`
+and `decision/decisionStateMachine.m` have never had any code path that
+reads CARLA traffic-light state (verified by `testDecisionLogicHasNoTrafficLightDependency`,
+a static content check against every file in `decision/`) - right-of-way
+has only ever come from perception + prediction + TTC + collision risk.
+
+## Actor classification fix (safety-relevant)
+
+Found during the pre-implementation audit: `carla_adapter.py`'s
+`classify()` already listed `"bicycle"` in `CLASS_NAMES`, but the code
+checked `number_of_wheels in (2,3)` **before** checking the blueprint's
+own `base_type` attribute, so every 2-wheeled actor - bicycles included -
+was always routed to `"motorcycle"`, making `"bicycle"` permanently
+unreachable dead code. This mattered: `behaviorDecision.m`'s
+`VULNERABLE_CLASSES` and `trajectoryPrediction.m`'s `irregularClasses`
+both key on the literal string `"bicycle"` for VRU protection - a real
+bicycle would have silently received neither.
+
+Fixed by checking `base_type` first (CARLA's own vehicle blueprints
+expose it directly - confirmed live: `vehicle.bh.crossbike`,
+`vehicle.diamondback.century`, `vehicle.gazelle.omafiets` all report
+`base_type='bicycle'`; `vehicle.harley-davidson.low_rider`,
+`vehicle.kawasaki.ninja`, `vehicle.vespa.zx125`, `vehicle.yamaha.yzf`
+report `base_type='motorcycle'`), with the wheel-count check kept only as
+a fallback for a blueprint that reports no `base_type` at all. Live-proven
+by `testGroundTruthClassificationDistinguishesBicycleFromMotorcycle` and
+by the hero scene's own ground-truth read: `bicycle=2, bus=1, car=8,
+motorcycle=3, pedestrian=1, truck=1` - the bicycle count would have been
+folded into motorcycle before this fix.
+
+**No true auto-rickshaw/3-wheeler blueprint exists in CARLA 0.9.16's
+stock library** (confirmed by enumerating every `vehicle.*` blueprint's
+`base_type` live - every entry is 4-wheel car/truck/van/bus or 2-wheel
+bicycle/motorcycle, nothing 3-wheeled). The hero scene represents an
+auto-rickshaw-equivalent using `vehicle.vespa.zx125` (a small scooter,
+the closest available visual/kinematic proxy), explicitly labelled as a
+substitute in `config/carlaIndianSceneConfig.m`, never claimed as a
+genuine match.
+
+## What exists after Phase 11.5
+
+```
+config/
+    carlaIndianSceneConfig.m       - deterministic scene manifest: map,
+                                      junction geometry, ego approach,
+                                      9 traffic actors (heterogeneous:
+                                      2 cars, 1 truck, 1 bus, 2
+                                      motorcycles, 1 scooter/auto-
+                                      rickshaw-proxy, 2 bicycles), 5
+                                      parked vehicles, 2 pedestrians, 8
+                                      road-defect ("pothole") props, 12
+                                      roadside-clutter/Indian-flavor
+                                      props (coconut palms, food cart,
+                                      plastic chairs/table, signage,
+                                      bins, bench, barrier)
+carlaIntegration/python/carla_adapter.py - EXTENDED:
+    classify()                     - bicycle/motorcycle fix (above)
+    spawn_ego_vehicle_at_transform / spawn_actor_at_transform
+                                    - absolute-world-coordinate spawning
+                                      (spawn_actor_relative_to_ego.m,
+                                      Phase 10, is ego-relative and
+                                      unmodified; this is additive)
+    freeze_traffic_lights          - non-controlling signal infrastructure
+    capture_snapshot                - one-shot RGB capture from an
+                                      arbitrary world transform (evidence
+                                      screenshots), independent of the
+                                      single ego-mounted camera slot
+carlaIntegration/matlab/
+    CarlaSession.m                 - EXTENDED: spawnEgoVehicleAtTransform/
+                                      spawnActorAtTransform/
+                                      freezeTrafficLights/captureSnapshot
+    carlaSpawnEgoVehicleAtTransform.m / carlaSpawnActorAtTransform.m /
+    carlaFreezeTrafficLights.m / carlaCaptureSnapshot.m
+                                    - free-function wrappers, matching
+                                      convention
+    carlaBuildIndianHeroScene.m    - scene orchestrator: connects, loads
+                                      Town03, spawns every actor/prop
+                                      from the config, freezes traffic
+                                      lights. Ground truth used ONLY for
+                                      staging (where to spawn), never fed
+                                      into perception/prediction/planning.
+    carlaIndianSceneTrafficStep.m  - per-tick scripted, NON-LANE-BASED
+                                      traffic motion (never CARLA
+                                      autopilot/Traffic Manager): each
+                                      actor has a free-text intent
+                                      (straight_through/slow_through/
+                                      roadside_edge/turn_left/turn_right/
+                                      informal_merge/following_ego_lane);
+                                      turning actors physically rotate
+                                      their commanded velocity by ±85° (or
+                                      ±40° for informal_merge) once they
+                                      come within 12m of the junction
+                                      center - a real applied direction
+                                      change, not a pre-baked animation
+carlaIntegration/tests/
+    testCarlaIndianHeroScene.m      - 13 tests (7 config-only, 6 live),
+                                      all pass
+```
+
+## Live verification evidence
+
+All against a real running CARLA 0.9.16 server, Town03, junction id=103.
+
+**Scene build**: 10/10 traffic actors, 5/5 parked vehicles, 2/2
+pedestrians, 8/8 road-defect props, 12/12 clutter props spawned
+successfully; 6 real traffic lights found and frozen; 0 failed spawns
+(one pedestrian position needed a 2m nudge during development after an
+initial spawn collision - fixed and re-verified).
+
+**Traffic motion** (60 ticks / 6s real time, positions read back via
+`carlaGetActorState`): every actor moved consistently with its scripted
+intent - e.g. `vehicle.audi.tt` (turn_right) moved from its North-approach
+spawn (2.15, 157.11) to (-6.9, 143.6), a real lateral displacement
+confirming the commanded turn was physically applied, not merely labeled.
+
+**Ground-truth classification** (`carlaGetNearbyActorObjects`, 120m
+range): `bicycle=2, bus=1, car=8, motorcycle=3, pedestrian=1, truck=1` -
+16 objects total, every class populated, bicycle and motorcycle correctly
+distinct.
+
+**Sensor sanity** (dense scene, ~27 actors/props total): camera frame
+produced, LiDAR 636 points, radar 14 detections, all finite - no
+catastrophic clutter observed at this actor density (detailed
+sensor/fusion retuning remains Phase 11.6's job, not attempted here).
+
+**Cleanup**: independent fresh-client query after `carlaDisconnect()`
+confirmed 0 vehicle/pedestrian/sensor actors remained.
+
+**Repeatability**: scene rebuilt twice in the same test run, identical
+traffic-actor spawn count both times.
+
+**Evidence images**: `results/figures/phase115_overview.png` (elevated
+bird's-eye view over the full intersection - visible: non-lane-following
+scattered vehicle positions, a bus mid-turn at an angle, a pedestrian
+crossing, coconut palms, tile-roofed buildings), `results/figures/phase115_ego_view.png`
+(ego's approach view - visible: coconut palms lining the road, a bus-stop
+shelter structure, roadside signage, another vehicle ahead in the
+intersection).
+
+## Regression re-verification after Phase 11.5
+
+- `testCarlaIndianHeroScene.m` (new): **13/13 passed** (live CARLA).
+- `testCarlaIntegration.m` (Phase 9), `testCarlaSensors.m` (Phase 10),
+  `testCarlaPerceptionFusion.m` (Phase 11): **6/6, 9/9, 12/12 - all still
+  passed**, unmodified.
+- `tests/testCollisionCheck.m` / `testPlanner.m` / `testPrediction.m`:
+  **14/14 passed** (no CARLA dependency).
+- All five scenarios via `main(name, false)`: **5/5 goal reached, 0/5
+  geometric collisions** - identical to the pre-Phase-11.5 baseline.
+- `git diff` confirmed **empty** for every frozen file: K1, K2,
+  `collisionCheck.m`, `localPlanner.m`, `behaviorDecision.m`,
+  `decisionStateMachine.m`, `behaviorSeverity.m`, `objectTracking.m`,
+  `sensorFusion.m`, `purePursuitController.m`, `vehicleController.m`,
+  every Phase 12 file (`carlaTrackingStep.m`, `carlaPredictionStep.m`,
+  `carlaClosedLoopInit.m`, `carlaClosedLoopStep.m`,
+  `carlaTrackingPredictionDemo.m` - all left exactly as Phase 12 last
+  left them), and every prior test file.
+
+## Known limitations (Phase 11.5)
+
+- Lane markings cannot be removed from Town03's stock road mesh (see
+  honest limitation note above) - the autonomy stack's independence from
+  lane geometry is what actually matters, and that is unaffected.
+- No true auto-rickshaw/3-wheeler CARLA blueprint exists; a scooter
+  (`vehicle.vespa.zx125`) is used as the closest available substitute,
+  explicitly labelled as such.
+- The ego is staged at its approach point only - it does not yet drive
+  or turn through the intersection (Phase 14's explicit job). Its turning
+  route is physically feasible (confirmed: `vehicleConfig.m`'s wheelbase/
+  maxSteerAngle give a ~3.9m minimum turn radius, well inside this
+  junction's real geometry) but not yet exercised.
+- Sensor range/fusion/tracking tuning against this specific dense scene
+  (as opposed to the basic sanity check performed here) is Phase 11.6's
+  job, not attempted here.
+- The traffic-actor turn trigger (12m from junction center) and speeds
+  are reasonable engineering choices for a readable demo, not derived
+  from a specific real-world Indian intersection's measured geometry.
+
+## What Phase 11.5 deliberately does NOT include
+
+Any change to K1, K2, `collisionCheck.m`, `behaviorDecision.m`,
+`decisionStateMachine.m`, `objectTracking.m`, `sensorFusion.m`,
+`localPlanner.m`, `purePursuitController.m`, `vehicleController.m`, or
+any Phase 12 file; sensor/fusion parameter retuning for the new scene
+(Phase 11.6); ego turning execution (Phase 14); CARLA autopilot or
+Traffic Manager for any actor, ego included; a scripted/pre-recorded ego
+trajectory. All later-phase work, out of scope here by explicit
+instruction.

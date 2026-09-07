@@ -122,16 +122,15 @@ decisionSpeedFactors = struct( ...
 simCfg.numSteps = 500;
 simCfg.realTimePlot = realTimePlotOverride;
 
-% Slows the animation for manual review: each 0.1s simulation step gets an
-% extra real-world pause on top of however long drawing the frame took, so
-% a full run takes roughly numSteps * PLAYBACK_SLOWDOWN seconds to watch
-% instead of finishing in a couple of seconds. Set to 0 to run at whatever
-% speed MATLAB can draw (e.g. for headless/batch runs).
-PLAYBACK_SLOWDOWN = 0.3; % [s] extra pause per frame
+% Render-layer playback rate (visualization/RealtimeRenderer.m):
+% 1.0 = smooth, real-time-equivalent playback via ~60 FPS interpolated
+% sub-frames between the real 10 Hz simulation ticks; lower = slower/more
+% deliberate for a walkthrough. This is a rendering-layer setting only -
+% it never touches simCfg.dt or the simulation's own iteration rate.
+PLAYBACK_RATE = 1.0;
 
 if simCfg.realTimePlot
-    fig = figure('Name', 'Closed-loop demo');
-    ax = axes(fig);
+    renderer = RealtimeRenderer(PLAYBACK_RATE);
 end
 
 % Per-step + summary logs to results/logs/, gated by simCfg.logToFile, so
@@ -299,24 +298,16 @@ for t = 1:steps
     end
 
     % --- 8. Visualization ---
+    % Decoupled render layer (visualization/RealtimeRenderer.m): the real
+    % simulation state computed above (egoState, trackedAgents,
+    % predictedTrajectories, smoothPath, decisionState, ...) is handed to
+    % the renderer READ-ONLY, once per real 10 Hz tick; the renderer
+    % internally draws ~60 FPS interpolated sub-frames using persistent
+    % graphics handles (no per-tick cla()/fresh-plot(), no pause() here)
+    % and paces itself to a measured, real frame rate. Nothing computed
+    % by the renderer is ever read back into the simulation.
     if simCfg.realTimePlot
-        cla(ax);
-        hold(ax, 'on');
-        plotPredictedTrajectories(predictedTrajectories, ax);
-        plotDetectedObjects(trackedAgents, egoState, ax);
-        plotPlannedPath(smoothPath, egoState, ax);
-        axis(ax, 'equal');
-        grid(ax, 'on');
-        xlabel(ax, 'x [m]');
-        ylabel(ax, 'y [m]');
-        title(ax, sprintf('%s | t=%.1fs | speed=%.1f m/s (target %.1f) | state=%s | minTTC=%.1fs | tracked=%d', ...
-            scenario.name, egoState.timestamp, egoState.velocity, targetSpeed, decisionState, minTTC, numel(trackedAgents)), ...
-            'Interpreter', 'none');
-        hold(ax, 'off');
-        drawnow limitrate;
-        if PLAYBACK_SLOWDOWN > 0
-            pause(PLAYBACK_SLOWDOWN);
-        end
+        renderer.update(egoState, trackedAgents, predictedTrajectories, smoothPath, decisionState, targetSpeed, minTTC, scenario.name);
     end
 
     if norm([egoState.x, egoState.y] - scenario.egoGoal) < goalTolerance
@@ -385,9 +376,8 @@ if simCfg.logToFile
 end
 
 if simCfg.realTimePlot
-    hold(ax, 'on');
-    plot(ax, egoHistory(:, 1), egoHistory(:, 2), 'g-', 'LineWidth', 1.5);
-    hold(ax, 'off');
+    renderer.drawFinalTrace(egoHistory);
+    fprintf('Final measured render rate: %.0f FPS (target ~60 FPS)\n', renderer.getMeasuredFPS());
 end
 
 %% Evaluation (placeholder, Phase 6+)
