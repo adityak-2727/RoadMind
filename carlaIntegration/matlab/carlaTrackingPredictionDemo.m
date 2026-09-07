@@ -541,17 +541,27 @@ for k = 1:NUM_TICKS
         eh = [history.x' - report.egoState.x, history.y' - report.egoState.y]; % ego-relative trail for readability
         plot(axTop, eh(:,1), eh(:,2), 'k-', 'LineWidth', 1);
         scatter(axTop, 0, 0, 100, 'k', '^', 'filled');
+        % Phase 13 fix: trackedAgents/predictedTrajectories are GLOBAL
+        % frame now (carlaFusedAgentsToGlobal.m - carlaPerceptionStep's
+        % ego-relative output was never being converted back before
+        % reaching the frozen decision/planning stack, which silently
+        % defeated every distance/TTC check; see carlaClosedLoopStep.m).
+        % Translate+rotate into an ego-heading-aligned view HERE, for
+        % display only, to keep this plot's original "ego-relative for
+        % readability" appearance.
+        ce = cos(-report.egoState.yaw); se = sin(-report.egoState.yaw);
+        toView = @(xy) [ce*(xy(:,1)-report.egoState.x) - se*(xy(:,2)-report.egoState.y), ...
+                        se*(xy(:,1)-report.egoState.x) + ce*(xy(:,2)-report.egoState.y)];
         for i = 1:numel(report.trackedAgents)
-            % trackedAgents are already ego-relative (carlaPerceptionStep's
-            % worldToEgoFrame transform, preserved through tracking).
-            relPos = report.trackedAgents(i).position;
+            relPos = toView(report.trackedAgents(i).position);
             scatter(axTop, relPos(1), relPos(2), 70, 'g', 'o', 'LineWidth', 1.5);
             traj = report.predictedTrajectories{i};
             if ~isempty(traj)
-                plot(axTop, traj(:,1), traj(:,2), 'b--');
+                trajView = toView(traj(:,1:2));
+                plot(axTop, trajView(:,1), trajView(:,2), 'b--');
                 theta = linspace(0, 2*pi, 12);
                 lastR = traj(end, 3);
-                fill(axTop, traj(end,1) + lastR*cos(theta), traj(end,2) + lastR*sin(theta), 'b', 'FaceAlpha', 0.15, 'EdgeColor', 'none');
+                fill(axTop, trajView(end,1) + lastR*cos(theta), trajView(end,2) + lastR*sin(theta), 'b', 'FaceAlpha', 0.15, 'EdgeColor', 'none');
             end
             text(axTop, relPos(1)+0.4, relPos(2)+0.4, sprintf('id%d %s', report.trackedAgents(i).id, report.behaviorInfo(i).label), 'FontSize', 7);
         end

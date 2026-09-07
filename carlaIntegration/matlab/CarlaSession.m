@@ -191,6 +191,20 @@ classdef CarlaSession < handle
             obj.PyAdapter.set_actor_target_velocity(pyargs('actor_id', int32(actorId), 'vx', vx, 'vy', vy, 'vz', vz));
         end
 
+        function setActorVelocityRelativeToEgo(obj, actorId, forwardMps, rightMps, upMps)
+            % Phase 13: sets a non-ego actor's velocity as components
+            % along the ego's OWN current forward/right axes (recomputed
+            % from the live ego transform), guaranteeing a "closing right"
+            % component actually moves the actor toward the ego's path
+            % regardless of the road's absolute world heading - see
+            % carla_adapter.py's set_actor_velocity_relative_to_ego()
+            % docstring for the live bug this replaces.
+            obj.assertConnected();
+            obj.PyAdapter.set_actor_velocity_relative_to_ego(pyargs( ...
+                'actor_id', int32(actorId), 'forward_mps', forwardMps, ...
+                'right_mps', rightMps, 'up_mps', upMps));
+        end
+
         function rawState = getActorState(obj, actorId)
             obj.assertConnected();
             pyState = obj.PyAdapter.get_actor_state(pyargs('actor_id', int32(actorId)));

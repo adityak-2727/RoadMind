@@ -1,4 +1,4 @@
-function loopState = carlaClosedLoopInit(forwardDistanceMeters, baseSpeedMps, demoRangeMeters)
+function loopState = carlaClosedLoopInit(forwardDistanceMeters, baseSpeedMps, demoRangeMeters, customGlobalPath)
 % carlaClosedLoopInit - Phase 12: builds the state bundle for
 % carlaClosedLoopStep.m's tick-by-tick closed loop. Call once after
 % carlaConnect/carlaSpawnEgoVehicle/carlaAttachCamera/carlaAttachLidar/
@@ -23,6 +23,19 @@ function loopState = carlaClosedLoopInit(forwardDistanceMeters, baseSpeedMps, de
 %                            readable, deterministic jury demo (Phase 12
 %                            spec: "prioritize correctness... deterministic
 %                            demonstration" over speed).
+%   customGlobalPath        - optional, Phase 13: an Nx2 waypoint array
+%                             (e.g. from carlaGenerateIntersectionTurnPath.m)
+%                             to use INSTEAD of the straight-line
+%                             fallback above. When given, startPose/
+%                             goalPose/globalPlanner() are skipped
+%                             entirely and this path is used as-is -
+%                             localPlanner.m (frozen) consumes it
+%                             identically either way (arc-length
+%                             parameterization, no straight-line
+%                             assumption - confirmed by inspection during
+%                             the Phase 11.5 audit), so this is a pure
+%                             path-source substitution, not a change to
+%                             any planning/decision logic.
 %   demoRangeMeters         - optional, default 30. Overrides
 %                             carlaPerceptionConfig()'s default
 %                             maxSensorRangeMeters (60) for THIS demo
@@ -55,10 +68,15 @@ end
 
 egoState0 = carlaGetEgoState();
 
-startPose = [egoState0.x, egoState0.y, egoState0.yaw];
-goalPose  = [egoState0.x + forwardDistanceMeters * cos(egoState0.yaw), ...
-             egoState0.y + forwardDistanceMeters * sin(egoState0.yaw), 0];
-globalPath = globalPlanner(startPose, goalPose, []); % unmodified frozen function
+if nargin >= 4 && ~isempty(customGlobalPath)
+    globalPath = customGlobalPath;
+    goalPose = [globalPath(end, 1), globalPath(end, 2), 0];
+else
+    startPose = [egoState0.x, egoState0.y, egoState0.yaw];
+    goalPose  = [egoState0.x + forwardDistanceMeters * cos(egoState0.yaw), ...
+                 egoState0.y + forwardDistanceMeters * sin(egoState0.yaw), 0];
+    globalPath = globalPlanner(startPose, goalPose, []); % unmodified frozen function
+end
 
 perceptionCfg = carlaPerceptionConfig();
 perceptionCfg.maxSensorRangeMeters = demoRangeMeters;

@@ -102,6 +102,24 @@ loopState.tickCount = loopState.tickCount + 1;
 [fusedAgents, obs] = carlaPerceptionStep(loopState.perceptionCfg, false, loopState.previousFusedAgents);
 loopState.previousFusedAgents = fusedAgents;
 
+% --- Phase 13 fix: carlaPerceptionStep.m deliberately returns fusedAgents
+% in the EGO-RELATIVE frame (needed for its own internal sensor-range
+% gate) - but every frozen function downstream of tracking
+% (objectTracking/trajectoryPrediction/behaviorDecision/localPlanner/
+% adaptivePlanner/collisionCheck) is validated against, and assumes,
+% agent positions in the SAME GLOBAL frame as egoState.x/y and
+% globalPath (confirmed directly from main.m and from
+% behaviorDecision.m's own `relVec = agent.position - [egoState.x,
+% egoState.y]`). Converting back to global frame here, before tracking
+% even runs, is what carlaFusedAgentsToGlobal.m's header documents in
+% full - this single missing conversion was silently defeating every
+% distance/TTC-based safety check in the CARLA closed loop. Applied
+% unconditionally, using THIS tick's egoState (not obs.egoState from a
+% stale previous cycle).
+if ~isempty(obs.egoState)
+    fusedAgents = carlaFusedAgentsToGlobal(fusedAgents, obs.egoState);
+end
+
 report = struct('tickCount', loopState.tickCount, 'dt', dt, 'obs', obs, 'fusedAgents', fusedAgents);
 
 if isempty(obs.egoState)
@@ -139,12 +157,35 @@ else
 end
 
 % --- 6. Planning (K2, UNMODIFIED) + collision check (UNMODIFIED) ---
+planningTic = tic; % Phase 13: planner-only wall-clock time, NOT the fixed
+                    % simulation/model timestep - measured separately from
+                    % the perception/tracking/prediction work above.
 candidateTrajectories = localPlanner(egoState, loopState.globalPath, predictedTrajectories, loopState.planCfg);
 priorIdx = loopState.previousCandidateIndex;
 [selectedTrajectory, loopState.previousCandidateIndex] = adaptivePlanner( ...
     egoState, candidateTrajectories, predictedTrajectories, loopState.vehCfg, loopState.planCfg, "carlaClosedLoop", priorIdx);
 [isColliding, minTTC] = collisionCheck(selectedTrajectory, predictedTrajectories, loopState.vehCfg);
 smoothPath = pathSmoothing(selectedTrajectory, struct());
+planningElapsedS = toc(planningTic);
+
+% --- Phase 13 planning diagnostics (reporting only - does not affect
+% which candidate is selected, that decision is made entirely inside the
+% frozen adaptivePlanner.m call above). Re-runs collisionCheck.m (frozen,
+% unmodified) on EVERY candidate exactly as adaptivePlanner.m already
+% does internally, purely to expose the feasible/collision-rejected/TTC-
+% rejected breakdown that function computes but does not return. This is
+% observing the frozen function's own ground truth from outside, not a
+% second decision-making implementation. ---
+nCandidates = numel(candidateTrajectories);
+candidateMinTTC = Inf(1, nCandidates);
+candidateColliding = false(1, nCandidates);
+for ci = 1:nCandidates
+    [candidateColliding(ci), candidateMinTTC(ci)] = collisionCheck(candidateTrajectories{ci}, predictedTrajectories, loopState.vehCfg);
+end
+collisionRejectedCount = sum(candidateColliding);
+ttcRejectedCount = sum(~candidateColliding & candidateMinTTC < loopState.planCfg.ttcThresholds.critical);
+feasibleCount = sum(~candidateColliding & candidateMinTTC >= loopState.planCfg.ttcThresholds.critical);
+usedFallback = feasibleCount == 0 && nCandidates > 0;
 
 % --- 7. Control (UNMODIFIED) ---
 controlCommand = vehicleController(egoState, smoothPath, loopState.vehCfg, targetSpeed, dt);
@@ -171,5 +212,19 @@ report.controlCommand         = controlCommand;
 report.carlaSteer              = carlaSteer;
 report.stateTransitionCount   = loopState.stateTransitionCount;
 report.goalDistance            = norm([egoState.x, egoState.y] - loopState.goalPosition);
+
+% --- Phase 13 additions (all purely additive reporting - see the block
+% above for how these are computed; none of it feeds back into
+% selection) ---
+report.planningElapsedS        = planningElapsedS;
+report.totalCandidates         = nCandidates;
+report.feasibleCandidateCount  = feasibleCount;
+report.collisionRejectedCount  = collisionRejectedCount;
+report.ttcRejectedCount        = ttcRejectedCount;
+report.candidateMinTTC         = candidateMinTTC;
+report.candidateColliding      = candidateColliding;
+report.usedFallback            = usedFallback;
+report.selectedCandidateIndex  = loopState.previousCandidateIndex;
+report.candidateChanged        = ~isequal(loopState.previousCandidateIndex, priorIdx);
 
 end

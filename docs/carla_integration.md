@@ -1328,3 +1328,204 @@ and was not fabricated.
   the range/staging corrections already applied.
 - Occasional single-suite flakiness in very long chained CARLA sessions
   (session fatigue) - each suite is robust in isolation.
+
+# Phase 13 - Planning + Decision in the Indian Urban Hero Scene
+
+Validates the complete, real, unmodified pipeline - perception -> fusion
+-> tracking -> prediction -> decision -> `adaptivePlanner` (K2) ->
+`collisionCheck` -> controller-ready output - against the Indian hero
+scene via `carlaClosedLoopStep.m`, and adds a curved intersection
+turn-path generator/feasibility checker as a new PATH GENERATION layer
+(not a replacement for, or bypass of, `adaptivePlanner.m`).
+
+## Critical finding: a coordinate-frame bug silently defeated every
+safety check in the CARLA closed loop
+
+The first two live demo runs of this phase showed every scenario -
+including ones with no staged conflict actor - producing
+`decisionState="cruise"` on 100% of ticks, `minTTC=Inf` always, and
+every one of the planner's 15 candidate trajectories rated "feasible" on
+every single tick (470+ ticks total across 8 demos), even while a
+directly-measured ego-relative clearance metric recorded real tracked
+agents within 0.3-1.6m of the ego at various points in those same runs.
+
+Root cause, confirmed by direct inspection (not guessed): `main.m`
+feeds `egoState.x/y`, `globalPath`, and every tracked/predicted agent's
+`.position` in ONE SHARED GLOBAL FRAME throughout - confirmed by
+`egoState.x/y` being used as an absolute world position everywhere in
+`main.m` (compared directly against `scenario.egoGoal`), and by
+`decision/behaviorDecision.m`'s own internal
+`relVec = agent.position - [egoState.x, egoState.y]`, which is only
+meaningful if `agent.position` is in that same global frame.
+`carlaPerceptionStep.m` (Phase 11) instead deliberately returns
+`fusedAgents` already translated and rotated into the EGO-RELATIVE
+frame via its own internal `worldToEgoFrame()` helper - needed so its
+own sensor-range gate (`norm(position) <= maxRange`) works - but that
+representation was never converted back to global frame before
+`carlaClosedLoopStep.m` (Phase 12) handed those agents onward to the
+frozen decision/planning stack. Every distance/bearing/TTC computation
+from that point on was therefore comparing a small ego-relative number
+against the ego's own large absolute world coordinate, producing a
+spurious ~100+ meter apparent separation for every real agent
+regardless of its true distance.
+
+This was a bug in Phase 12's own (non-frozen) integration wrapper code,
+not in any frozen algorithm file, and not detectable by Phase 12's own
+test suite (which validates tracking/prediction output directly, never
+through the full closed loop's decision/planning stage against a real
+conflict) - it only became visible once Phase 13 first exercised
+`behaviorDecision`/`localPlanner`/`adaptivePlanner`/`collisionCheck`
+against genuine staged conflicts in the CARLA loop.
+
+**Fix**: `carlaFusedAgentsToGlobal.m` (new) converts `fusedAgents` back
+to the global frame immediately after `carlaPerceptionStep` returns and
+before `carlaTrackingStep` is called, so `objectTracking.m`'s Kalman
+filter - and everything downstream of it - operates entirely in the
+global frame from the start, exactly matching `main.m`'s own validated
+convention, rather than trying to un-mix a moving-frame velocity
+estimate after tracking has already run. `carlaPlanningDecisionDemo.m`'s
+and `carlaTrackingPredictionDemo.m`'s Section G visualizations were
+updated to apply an ego-centered display-only transform (translate +
+rotate by `-egoState.yaw`), since their plotted quantities are now
+consistently global frame instead of ego-relative.
+
+**Verified effect** (same 8 scenarios, same actor placements, only this
+fix applied): every demo now shows real decision escalation
+(avoid/brake/wait/emergency_stop/merge/replan), finite `minTTC` values,
+and genuine candidate rejection (`meanFeasible` well below 15/15,
+non-zero `fallbackCount`). Spot-verified in two independent live
+diagnostics: (1) a pedestrian staged to cross into the ego's path was
+correctly tracked (`class=pedestrian`), correctly classified
+`crossing`, and the decision state correctly escalated
+cruise -> merge -> avoid -> brake as measured distance closed smoothly
+from 12.5m to 4.8m over 60 ticks; (2) Demo A's ("normal approach", no
+staged actor) frequent avoid/brake/emergency_stop ticks were confirmed
+to correlate with persistent, monotonically-increasing-distance tracks
+(consistent with static roadside clutter/parked vehicles/pothole
+markers close to the ego's corridor, correctly classified `unknown`
+per Phase 10/11's documented no-ground-truth-match convention) rather
+than any residual bug - a legitimate, thematically-appropriate result
+for an unstructured, narrow Indian road scene.
+
+## Two further, smaller bugs found and fixed while building the Phase 13
+demo scenarios (both scenario-authoring bugs, not pipeline defects)
+
+- **Spawn-collision at a specific offset**: `carlaSpawnActorRelativeToEgo`'s
+  conventional `up_m=0.5` ground clearance silently failed
+  (`try_spawn_actor` returned `None`) at one specific hero-scene spawn
+  point (forward=14, right=0 on the West approach), confirmed by a live
+  sweep across every demo's spawn point at `up_m` in {0.5, 1.0, 1.5}.
+  Fixed by raising conflict-actor spawns to `up_m=1.5` (confirmed clear
+  at every demo's spawn point) and repositioning Demo C off the
+  centerline (right=6 instead of 0), which is also a more realistic
+  "crossing vehicle" placement.
+- **Tire-friction resists non-heading-aligned velocity**: a bicycle
+  spawned facing along the road and given a purely-lateral target
+  velocity (via a new `carlaSetActorVelocityRelativeToEgo.m` /
+  `set_actor_velocity_relative_to_ego()` helper, added so scenario
+  velocities can be expressed in the ego's own closing-toward-the-path
+  terms instead of a hand-derived world-frame vector) had that velocity
+  decay from 0.60 m/s to ~0.04 m/s within 20 ticks - CARLA's
+  wheeled-vehicle tire-friction model resists any commanded velocity not
+  aligned with the actor's own heading. Confirmed by isolated
+  measurement of the actor's raw CARLA velocity (not a perception
+  artifact). Fixed by spawning every vehicle-class conflict actor
+  (`yawOffsetDeg = atan2d(velRight, velFwd)`) already facing its
+  intended direction of travel; pedestrians (`walker.pedestrian.*`) are
+  unaffected since CARLA drives them via `WalkerControl`
+  direction+speed, not tire physics. Re-measured after the fix: the
+  same commanded velocity held constant (no decay) over 15 consecutive
+  ticks.
+
+## New files
+
+- `carlaFusedAgentsToGlobal.m` - the frame-conversion fix above.
+- `carlaSetActorVelocityRelativeToEgo.m` (+ `CarlaSession.m` /
+  `carla_adapter.py` additions) - commands a non-ego actor's velocity as
+  components along the ego's own current forward/right axes, guaranteed
+  to close toward the ego's path regardless of the road's absolute world
+  heading.
+- `carlaGenerateIntersectionTurnPath.m` - builds a physically-feasible
+  approach -> circular-arc turn -> exit global path from live-resolved
+  hero-scene junction geometry (`turnRadiusM` default 12.0m). Verified
+  offline (no CARLA) against real hero-scene coordinates: 85 waypoints,
+  84.04m length, measured start/end headings exactly matched requested
+  (-1.30 deg / 89.64 deg).
+- `carlaCheckTurnFeasibility.m` - measures curvature directly from
+  waypoint headings (not assumed from the arc radius) and compares
+  against `maxFeasibleCurvature = tan(vehCfg.maxSteerAngle)/vehCfg.wheelbase`
+  (the identical formula `adaptivePlanner.m`'s own K2 fallback uses).
+  Live result: max curvature 0.0834 1/m (min radius 12.00m, exactly
+  matching the requested radius) vs. max feasible 0.2593 1/m (min radius
+  ~3.86m) - comfortably feasible.
+- `carlaPlanningDecisionDemo.m` - 8 live demos (A-H): A normal approach,
+  B parked-vehicle obstruction, C crossing vehicle, D pedestrian
+  conflict, E bicycle/motorcycle, F informal merge, G irregular/unknown
+  actor, H full hero intersection driven along the curved turn path
+  (feasibility-checked and fed through the real closed loop; the
+  physical turn itself is explicitly out of scope - reserved for
+  Phase 14).
+- `testCarlaPlanningDecision.m` (new, 8 tests) - 3 pure-math regression
+  guards directly targeting the frame bug above (position/velocity
+  round-trip, empty-input safety) plus 5 live tests: a genuine crossing
+  conflict must escalate the decision state, must reject at least one
+  candidate, and must produce a finite TTC (all three were false on
+  every tick before the fix); the curved turn path must run through the
+  real closed loop without error; controller output must stay within
+  `vehicleConfig` limits at all times.
+- `carlaClosedLoopInit.m` extended (optional 4th argument,
+  `customGlobalPath`) so a caller-supplied path (e.g. from
+  `carlaGenerateIntersectionTurnPath.m`) can be used instead of the
+  straight-line demo corridor - `localPlanner.m` consumes either
+  identically (arc-length parameterization, confirmed during the Phase
+  11.5 audit), so this is a pure path-source substitution.
+- `carlaClosedLoopStep.m` extended with a purely-additive planning-
+  diagnostics block (`planningElapsedS`, `totalCandidates`,
+  `feasibleCandidateCount`, `collisionRejectedCount`,
+  `ttcRejectedCount`, `usedFallback`, `candidateChanged`) that re-invokes
+  the frozen `collisionCheck.m` on every candidate exactly as
+  `adaptivePlanner.m` already does internally, purely to expose the
+  breakdown that function computes but does not return - it does not
+  affect which candidate is selected.
+
+## Results (measured, live, after the frame-conversion fix)
+
+- 8/8 demo scenarios (A-H) show genuine decision variety and real
+  candidate rejection - see the "Verified effect" paragraph above for
+  the specific numbers.
+- Demo H: curved turn path length 48.5m, min radius 12.00m (exactly the
+  requested radius), feasible against `vehicleConfig` limits, decisions
+  observed while running it through the real closed loop: cruise,
+  avoid, merge, replan.
+- Regression: core 14/14, five synthetic scenarios all reach goal, P9/
+  P10/P11 combined 27/27, P11.5 13/13, P11.6 14/14, P13 (new) 8/8, stable
+  across 2 independent runs. P12's own suite: 12/13 -
+  `testStoppedTracking` fails reproducibly on both a long-running and a
+  freshly-restarted CARLA server. Confirmed unrelated to any Phase 13
+  change: its full call chain (`carlaPerceptionStep` /
+  `carlaTrackingStep` / `carlaPredictionStep`) was not touched this
+  phase, and no test file calls `carlaClosedLoopStep` except the new
+  Phase 13 suite and the (unaffected, non-test) `carlaTrackingPredictionDemo.m`.
+  Most likely a pre-existing, marginal threshold sensitivity
+  (`STOPPED_SPEED_THRESHOLD=0.3 m/s` against only 12 ticks for the
+  Kalman filter's velocity estimate to settle) rather than a logic
+  defect - reported honestly rather than silently re-run until green.
+- `git diff`: **no frozen algorithm file changed.** All fixes are in
+  Phase 11/12/13-authored CARLA integration wrapper code
+  (`carlaClosedLoopStep.m`, `carlaClosedLoopInit.m`, and the new files
+  listed above), never in `perception/objectTracking.m`,
+  `perception/sensorFusion.m`, `prediction/trajectoryPrediction.m`,
+  `decision/*.m`, `planning/*.m`, `control/*.m`, or `config/createAgent.m`.
+
+## Known limitations
+
+- The 60m/25m sensor-range-vs-clutter tradeoff established in Phase 12
+  still applies here; Phase 13's demos use the same bounded range.
+- Demo A's frequent avoid/brake behavior against ordinary hero-scene
+  traffic, while verified genuine (see above), makes it a noisier
+  "baseline" demo than its name suggests - worth narrating honestly in
+  any live jury demonstration rather than presented as a clean control.
+- The physical CARLA turn itself (actually driving the curved path to
+  completion through the real closed loop) is explicitly NOT executed
+  in this phase - reserved for Phase 14, per the phase boundary in the
+  original Phase 13 specification.

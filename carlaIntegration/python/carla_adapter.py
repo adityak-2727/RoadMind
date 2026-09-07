@@ -659,6 +659,40 @@ class CarlaAdapter:
         else:
             actor.set_target_velocity(self._carla.Vector3D(x=vx, y=vy, z=vz))
 
+    def set_actor_velocity_relative_to_ego(self, actor_id: int, forward_mps: float = 0.0,
+                                            right_mps: float = 0.0, up_mps: float = 0.0):
+        """Sets a spawned non-ego actor's velocity as components along the
+        EGO's CURRENT forward/right axes (recomputed fresh from the ego's
+        live transform every call - not a one-time snapshot), then
+        forwards the resulting world-frame (vx, vy, vz) to
+        set_actor_target_velocity() (so the walker/vehicle branching there
+        is reused unchanged).
+
+        Why this exists (Phase 13): scenario scripts staging a controlled
+        conflict actor (crossing/merging/etc.) need to guarantee that
+        actor's motion actually closes toward the ego's path. Picking a
+        raw CARLA world-frame (vx, vy) by hand only does that if the
+        picker already knows the ego's world heading at that spot - easy
+        to get backwards or zero-out the very component that mattered
+        (found live: a bicycle given world-frame vel=(-1.0, 0.0) at a
+        road oriented ~parallel to world X turned out to have ZERO
+        lateral closing component, so it passed the ego at a constant
+        offset for the entire run without ever entering the planning
+        corridor - not a perception/decision/planning defect, a scenario-
+        authoring one). Expressing the intended motion directly in the
+        ego's own forward/right axes - the SAME axes
+        spawn_actor_relative_to_ego() already uses to place the actor -
+        removes that class of mistake entirely.
+        """
+        if self._ego_vehicle is None:
+            raise CarlaAdapterError("set_actor_velocity_relative_to_ego() called before spawn_ego_vehicle().")
+        ego_transform = self._ego_vehicle.get_transform()
+        forward_vec = ego_transform.get_forward_vector()
+        right_vec = ego_transform.get_right_vector()
+        vx = forward_vec.x * forward_mps + right_vec.x * right_mps
+        vy = forward_vec.y * forward_mps + right_vec.y * right_mps
+        self.set_actor_target_velocity(actor_id, vx, vy, up_mps)
+
     def get_actor_state(self, actor_id: int) -> dict:
         """Returns a non-ego test actor's raw CARLA-frame state, in the
         same shape as get_vehicle_state(), for coordinate-verification
