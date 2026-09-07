@@ -43,6 +43,17 @@ carlaCfg = carlaConfig();
 carlaCfg.mapName = cfg.mapName;
 carlaConnect(carlaCfg);
 
+% FIX (found during the Phase 11.6 audit): carlaConnect()/connect() never
+% loads a specific map on its own - see carlaLoadMap.m's header. Without
+% this, a scene built against a freshly-launched server (which defaults
+% to Town10HD_Opt) would silently spawn this scene's Town03-specific
+% coordinates into the wrong map's geometry.
+mapReloaded = carlaLoadMap(cfg.mapName);
+if mapReloaded
+    fprintf('[carlaBuildIndianHeroScene] Loaded map %s (was not already active).\n', cfg.mapName);
+    pause(2.0); % let the new world settle before spawning into it
+end
+
 sceneState = struct();
 sceneState.failedSpawns = repmat(struct('kind', "", 'index', 0, 'blueprint', ""), 0, 0);
 

@@ -128,6 +128,49 @@ class CarlaAdapter:
     def is_connected(self) -> bool:
         return self._world is not None
 
+    def load_map(self, map_name: str):
+        """Loads the named CARLA map if it is not already the active one.
+
+        FOUND DURING PHASE 11.6 AUDIT: connect() (above, Phase 9,
+        unmodified) never loads a specific map - it only attaches to
+        whatever the server already has running, which defaults to
+        Town10HD_Opt on a fresh launch. carlaConfig.m's/
+        carlaIndianSceneConfig.m's mapName field was therefore dead
+        configuration for any session that had not already had the right
+        map loaded by some other means (this is exactly what happened
+        during Phase 11.5 testing - Town03 was loaded once via a separate
+        investigation script and simply stayed loaded for the rest of
+        that server session, masking the gap). Confirmed live: a scene
+        built against a cold server without this call produced 9 spawn
+        failures out of 19 actors, because the hero scene's Town03-
+        specific coordinates were being used to spawn actors into
+        Town10HD_Opt's completely different geometry.
+
+        This is additive - connect() itself is unchanged; callers that
+        don't need a specific map (Phase 9/10/11/12's existing tests,
+        which all run against whatever map is already loaded) are
+        unaffected. client.load_world() is itself a somewhat slow,
+        blocking call (full map teardown/reload), so this only calls it
+        when the requested map is not already active.
+        """
+        if not self.is_connected():
+            raise CarlaAdapterError("load_map() called before connect().")
+        current_name = self._world.get_map().name  # e.g. "Carla/Maps/Town03"
+        if current_name.endswith(f"/{map_name}") or current_name == map_name:
+            return False  # already loaded, no reload needed
+
+        # A full map teardown/reload takes noticeably longer than a normal
+        # RPC call - the client's connect()-time timeout (config/
+        # carlaConfig.m's timeoutSeconds, typically 10s) is too short and
+        # was confirmed live to raise a timeout error here. Temporarily
+        # extend it for this one blocking call, then restore.
+        self._client.set_timeout(60.0)
+        try:
+            self._world = self._client.load_world(map_name)
+        finally:
+            self._client.set_timeout(self.timeout)
+        return True
+
     # ------------------------------------------------------------------
     # Ego vehicle spawn / state / control (Phase 9, unchanged)
     # ------------------------------------------------------------------

@@ -47,6 +47,15 @@ classdef CarlaSession < handle
             obj.Connected = true;
         end
 
+        function reloaded = loadMap(obj, mapName)
+            % Phase 11.6: loads the named CARLA map if it isn't already
+            % active - see carla_adapter.py's load_map() docstring for
+            % why this exists (connect() alone never loads a specific
+            % map). Returns true if a reload actually happened.
+            obj.assertConnected();
+            reloaded = logical(obj.PyAdapter.load_map(mapName));
+        end
+
         function actorId = spawnEgoVehicle(obj, cfg)
             obj.assertConnected();
             spawnIdx0Based = int32(cfg.spawnPointIndex - 1); % project is 1-based, CARLA/Python side is 0-based
