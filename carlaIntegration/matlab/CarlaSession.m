@@ -200,6 +200,31 @@ classdef CarlaSession < handle
             obj.PyAdapter.set_actor_hold(pyargs('actor_id', int32(actorId), 'hold', logical(hold)));
         end
 
+        function events = getNewCollisionEvents(obj, sinceIndex)
+            % Phase 14.11: same struct shape as getCollisionEvents, but
+            % only events at index >= sinceIndex (0-based, matching the
+            % count returned by a previous call) - see
+            % carla_adapter.py's get_new_collision_events() for why this
+            % exists instead of re-fetching the whole list every tick.
+            obj.assertConnected();
+            pyList = cell(obj.PyAdapter.get_new_collision_events(pyargs('since_index', int32(sinceIndex))));
+            n = numel(pyList);
+            events = repmat(struct('frame', 0, 'timestamp', 0, 'otherActorId', 0, ...
+                'otherActorType', "", 'impulseMagnitude', 0, 'egoX', 0, 'egoY', 0, ...
+                'egoYawDeg', 0), 1, n);
+            for i = 1:n
+                d = CarlaSession.pyDictToStruct(pyList{i});
+                events(i).frame = d.frame;
+                events(i).timestamp = d.timestamp_s;
+                events(i).otherActorId = d.other_actor_id;
+                events(i).otherActorType = string(d.other_actor_type);
+                events(i).impulseMagnitude = d.impulse_magnitude;
+                events(i).egoX = d.ego_x;
+                events(i).egoY = d.ego_y;
+                events(i).egoYawDeg = d.ego_yaw_deg;
+            end
+        end
+
         function n = getCollisionCount(obj)
             % Cheap collision-event count (an int, not the whole list) -
             % safe to poll every tick. See carla_adapter.py's
