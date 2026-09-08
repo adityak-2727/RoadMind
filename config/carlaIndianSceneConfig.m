@@ -139,7 +139,16 @@ cfg.trafficActors(end+1) = struct('blueprint','vehicle.yamaha.yzf',             
 % perpendicular direction, not a hand-guessed offset).
 % ---------------------------------------------------------------------
 cfg.parkedVehicles = struct('blueprint', {}, 'x', {}, 'y', {}, 'z', {}, 'yawDeg', {});
-cfg.parkedVehicles(end+1) = struct('blueprint','vehicle.citroen.c3',           'x', -5.19,'y',103.32,'z',0.30,'yawDeg', 89.64);
+% Phase 14.5 scene-authoring correction (measured, not cosmetic): this car
+% was at x=-5.19, which put its CENTRE 1.88m from the hero turn route's
+% centreline. Its half-width is 0.93m and the ego's is ~1.0m, so 1.93m is
+% the minimum non-contact separation - the parked car was ~5cm INSIDE the
+% ego's swept corridor, and forensics recorded the ego scraping it (actor
+% id 120, 50 collision events, t=95.5-96.2s). Moved 2.2m further onto the
+% roadside; it remains a realistic kerbside parked vehicle on the same
+% road with the same heading, it is simply no longer parked inside the
+% driving lane.
+cfg.parkedVehicles(end+1) = struct('blueprint','vehicle.citroen.c3',           'x', -2.99,'y',103.32,'z',0.30,'yawDeg', 89.64);
 cfg.parkedVehicles(end+1) = struct('blueprint','vehicle.mini.cooper_s_2021',   'x',-14.25,'y', 93.38,'z',0.30,'yawDeg', 89.64);
 cfg.parkedVehicles(end+1) = struct('blueprint','vehicle.seat.leon',            'x',-34.01,'y',130.24,'z',0.30,'yawDeg', -1.30);
 cfg.parkedVehicles(end+1) = struct('blueprint','vehicle.jeep.wrangler_rubicon','x', 36.13,'y',126.08,'z',0.30,'yawDeg',179.18);

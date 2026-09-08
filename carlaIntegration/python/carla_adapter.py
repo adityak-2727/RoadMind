@@ -487,15 +487,106 @@ class CarlaAdapter:
         return sensor.id
 
     def _on_collision(self, event):
+        # Phase 14.5 forensics: capture the FULL physical context at the
+        # instant of impact, not just "something was hit". Positions and
+        # velocities are read from the live actor handles inside the
+        # callback, so they describe the moment of contact rather than
+        # whenever MATLAB next happens to poll - which is what makes it
+        # possible to tell repeated events from ONE continuous contact
+        # apart from genuinely separate impacts (Phase 14.5 section 3).
+        # MUST stay non-blocking. This runs on the sensor's own callback
+        # thread, and a sustained contact fires it many times per second.
+        # An earlier Phase 14.5 version queried the other actor's live
+        # location/velocity/bounding box (and the ego's velocity) from
+        # inside this callback; with hundreds of rapid events those calls
+        # backed up and stalled the whole client - the maneuver hung with
+        # no output for 6+ minutes. Only fields already carried BY the
+        # event are read here; anything needing a world query is resolved
+        # afterwards by resolve_actor_snapshot() below.
         other = event.other_actor
         impulse = event.normal_impulse
+        ego_tf = event.transform  # ego transform at the moment of impact, already in the event
+
         self._collision_events.append({
             "frame": event.frame,
             "timestamp_s": event.timestamp,
             "other_actor_id": other.id if other is not None else -1,
             "other_actor_type": other.type_id if other is not None else "unknown",
             "impulse_magnitude": float((impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2) ** 0.5),
+            "ego_x": float(ego_tf.location.x),
+            "ego_y": float(ego_tf.location.y),
+            "ego_yaw_deg": float(ego_tf.rotation.yaw),
         })
+
+    def set_actor_hold(self, actor_id: int, hold: bool = True):
+        """Brings a scripted NON-EGO vehicle to a real stop (or releases
+        it), for the ego-proximity clamp in carlaIndianSceneTrafficStep.m.
+
+        Why this exists (Phase 14.5, measured): the clamp previously just
+        called set_target_velocity(0). That sets a target, it does NOT
+        brake - a 5.5 m/s bus commanded to zero target velocity COASTS,
+        and forensics showed it sliding into a stationary ego and coming
+        to rest against it (998 collision events, mean impulse 50 - i.e.
+        sustained resting contact rather than a single ram, with the ego
+        wedged at a fixed position and -21.8 deg yaw for 16 seconds).
+        Applying a real brake + hand brake actually arrests the vehicle
+        within its own stopping distance instead. Never applied to the
+        ego, and never CARLA autopilot - this is the same direct-control
+        channel the scripted traffic already uses."""
+        actor = self._other_actors.get(actor_id)
+        if actor is None:
+            actor = self._world.get_actor(int(actor_id))
+        if actor is None:
+            raise CarlaAdapterError(f"set_actor_hold: unknown actor_id {actor_id}.")
+        if actor.type_id.startswith('walker.pedestrian'):
+            speed = 0.0 if hold else 1.0
+            control = self._carla.WalkerControl(
+                direction=self._carla.Vector3D(x=1.0, y=0.0, z=0.0), speed=speed, jump=False)
+            actor.apply_control(control)
+            return
+        if hold:
+            actor.set_target_velocity(self._carla.Vector3D(x=0.0, y=0.0, z=0.0))
+            actor.apply_control(self._carla.VehicleControl(
+                throttle=0.0, steer=0.0, brake=1.0, hand_brake=True))
+        else:
+            actor.apply_control(self._carla.VehicleControl(
+                throttle=0.0, steer=0.0, brake=0.0, hand_brake=False))
+
+    def get_collision_count(self) -> int:
+        """Cheap count of collision events so far - returns an int, not the
+        whole list. get_collision_events() marshals every event across the
+        Python/MATLAB boundary, so polling IT once per tick is O(n^2) in
+        the number of events and was measured to crawl a run to a halt
+        once the count reached the thousands (Phase 14.5). Use this for
+        per-tick progress tracking and fetch the full list once, at the
+        end."""
+        if self._collision_sensor is None:
+            raise CarlaAdapterError("get_collision_count() called before attach_collision_sensor().")
+        return len(self._collision_events)
+
+    def resolve_actor_snapshot(self, actor_id: int) -> dict:
+        """Looks up one actor's CURRENT location/extent by id, for
+        post-run collision forensics. Called AFTER a run, never from
+        inside a sensor callback (see _on_collision). Static scene
+        objects - props, parked vehicles - have not moved, so this is
+        their impact position too; for a moving actor it is only its
+        end-of-run pose, and is labelled as such by the caller."""
+        if not self.is_connected():
+            raise CarlaAdapterError("resolve_actor_snapshot() called before connect().")
+        actor = self._world.get_actor(int(actor_id))
+        if actor is None:
+            return {"found": False, "x": float('nan'), "y": float('nan'),
+                    "extent_x": float('nan'), "extent_y": float('nan'), "type_id": "gone"}
+        loc = actor.get_location()
+        bb = getattr(actor, 'bounding_box', None)
+        return {
+            "found": True,
+            "x": float(loc.x),
+            "y": float(loc.y),
+            "extent_x": float(bb.extent.x) if bb is not None else float('nan'),
+            "extent_y": float(bb.extent.y) if bb is not None else float('nan'),
+            "type_id": actor.type_id,
+        }
 
     def get_collision_events(self) -> list:
         """Returns every collision event recorded since attach_collision_sensor()

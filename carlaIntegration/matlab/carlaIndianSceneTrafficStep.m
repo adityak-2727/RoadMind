@@ -2,7 +2,7 @@ function trafficState = carlaIndianSceneTrafficStep(sceneState, cfg, trafficStat
 % Phase 14 addition (optional 4th argument, backward compatible - every
 % existing caller that omits it gets EXACTLY the prior behavior):
 % egoPosXY, when given, is the ego's current [x, y] (this project's
-% frame). See the SAFETY_BUFFER_M block below for why this was added -
+% frame). See the proximity clamp block below for why this was added -
 % it is a hard-contact-prevention clamp, not a redesign of any actor's
 % scripted intent/heading/speed.
 % carlaIndianSceneTrafficStep - Phase 11.5: one tick of scripted,
@@ -74,14 +74,40 @@ TURN_ANGLE_DEG = struct('turn_left', 85, 'turn_right', -85, 'informal_merge', 40
 %
 % Fix: a hard, deterministic proximity clamp, applied ONLY when egoPosXY
 % is supplied - if a scripted actor is within SAFETY_BUFFER_M of the ego
-% AND its own commanded heading is closing that distance, it holds
-% (zero velocity) for that tick instead. This changes nothing about any
+% it holds (zero velocity) for that tick instead.
+% (An earlier revision only held when the actor was CLOSING on the ego;
+% that missed side-by-side/overtaking passes with near-zero longitudinal
+% closing speed, so the test is now unconditional.) This changes nothing about any
 % actor's intent, heading, per-intent speed, or turn-trigger geometry
 % when the ego is not in its immediate path - it only ever prevents the
 % specific failure mode of driving through the ego's own occupied space,
 % exactly like a standard NPC-traffic "don't drive through the other
 % car" safety net, not a redesign of the scripted scenario.
-SAFETY_BUFFER_M = 5.0; % center-to-center; real vehicle bodies are ~2m wide/~4.5m long, so this leaves genuine body clearance, not just a point-distance margin
+% Phase 14.5 NOTE - two attempted improvements to this clamp were tried
+% and BOTH measurably regressed the result, so both were reverted and the
+% Phase 14 value stands. Recorded here so they are not retried blindly:
+%
+%   (a) Body-aware clamp distance (actorHalfLength + egoHalfLength + 2m,
+%       ~9.5m for the 10.3m-long bus instead of a flat 5m). Rationale was
+%       sound - a flat 5m centre-to-centre test can never fire for a body
+%       that long. Measured result: real collision events rose 199 -> 1048
+%       on the same maneuver, because holding traffic further out turned
+%       nearby actors into stationary roadblocks the ego then had to
+%       squeeze past in an already-tight corridor.
+%   (b) (a) PLUS a genuine brake + hand brake on the held actor
+%       (set_actor_hold), since zeroing a TARGET velocity lets a 5.5 m/s
+%       bus coast rather than stop. Measured result: 3399 events - far
+%       worse. Forensics showed the ego WEDGED against a hand-braked
+%       actor for hundreds of ticks while its own decision state read
+%       "cruise" (a stationary obstacle at near-zero relative speed gives
+%       an effectively infinite TTC, so nothing escalated) - i.e. the fix
+%       created an immovable obstacle the ego could neither perceive as
+%       urgent nor drive around.
+%
+% The flat 5.0m clamp below is therefore kept as the best measured
+% configuration, NOT as a known-correct one - residual contacts remain and
+% are reported honestly rather than tuned away.
+SAFETY_BUFFER_M = 5.0;
 if nargin < 4
     egoPosXY = [];
 end
@@ -133,6 +159,8 @@ for i = 1:numel(cfg.trafficActors)
         [actorProjX, actorProjY] = carlaCoordToProject(actorRaw.location.x, actorRaw.location.y);
         toEgo = egoPosXY - [actorProjX, actorProjY];
         distToEgo = norm(toEgo);
+
+        clampDist = SAFETY_BUFFER_M; % see the Phase 14.5 note above for the two larger variants that were tried and regressed
         % Widened from a "hold only if closing" check (Phase 14, first
         % attempt) to an unconditional hold whenever within the buffer,
         % after live evidence showed it was insufficient: an offline
@@ -146,13 +174,13 @@ for i = 1:numel(cfg.trafficActors)
         % pass can have near-zero longitudinal closing speed while still
         % being far too close laterally for two real vehicle bodies to
         % occupy - the closing-speed test cannot see that case. Holding
-        % unconditionally whenever within SAFETY_BUFFER_M is simpler and
+        % unconditionally whenever within the clamp distance is simpler and
         % safe: it costs the SAME scripted actor a few ticks of paused
         % motion only when it is already within a couple of vehicle
         % lengths of the ego, changing nothing else about its intent/
         % heading/speed/turn-trigger geometry.
-        if distToEgo < SAFETY_BUFFER_M
-            vx = 0; vy = 0; % hold - see the Phase 14 header block above
+        if distToEgo < clampDist
+            vx = 0; vy = 0; % hold - see the Phase 14/14.5 header blocks above
         end
     end
 

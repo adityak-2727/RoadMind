@@ -172,7 +172,8 @@ classdef CarlaSession < handle
             pyList = cell(obj.PyAdapter.get_collision_events());
             n = numel(pyList);
             events = repmat(struct('frame', 0, 'timestamp', 0, 'otherActorId', 0, ...
-                'otherActorType', "", 'impulseMagnitude', 0), 1, n);
+                'otherActorType', "", 'impulseMagnitude', 0, 'egoX', 0, 'egoY', 0, ...
+                'egoYawDeg', 0), 1, n);
             for i = 1:n
                 d = CarlaSession.pyDictToStruct(pyList{i});
                 events(i).frame = d.frame;
@@ -180,7 +181,39 @@ classdef CarlaSession < handle
                 events(i).otherActorId = d.other_actor_id;
                 events(i).otherActorType = string(d.other_actor_type);
                 events(i).impulseMagnitude = d.impulse_magnitude;
+                % Phase 14.5 forensics: ego pose at the instant of impact
+                % (carried by the event itself - no world query, so the
+                % sensor callback stays non-blocking).
+                events(i).egoX = d.ego_x;
+                events(i).egoY = d.ego_y;
+                events(i).egoYawDeg = d.ego_yaw_deg;
             end
+        end
+
+        function setActorHold(obj, actorId, hold)
+            % Phase 14.5: really brake a scripted non-ego actor (brake +
+            % hand brake), rather than only zeroing its target velocity -
+            % see carla_adapter.py's set_actor_hold() for the measurement
+            % showing a coasting bus slid into a stopped ego regardless of
+            % a zero target velocity.
+            obj.assertConnected();
+            obj.PyAdapter.set_actor_hold(pyargs('actor_id', int32(actorId), 'hold', logical(hold)));
+        end
+
+        function n = getCollisionCount(obj)
+            % Cheap collision-event count (an int, not the whole list) -
+            % safe to poll every tick. See carla_adapter.py's
+            % get_collision_count() for why polling getCollisionEvents()
+            % per tick is not.
+            obj.assertConnected();
+            n = double(obj.PyAdapter.get_collision_count());
+        end
+
+        function snap = resolveActorSnapshot(obj, actorId)
+            % Phase 14.5 forensics: resolve one actor's position/extent by
+            % id AFTER a run (never from inside a sensor callback).
+            obj.assertConnected();
+            snap = CarlaSession.pyDictToStruct(obj.PyAdapter.resolve_actor_snapshot(pyargs('actor_id', int32(actorId))));
         end
 
         function objects = getNearbyActorObjects(obj, rangeM)
