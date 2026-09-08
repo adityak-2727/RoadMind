@@ -1,4 +1,10 @@
-function trafficState = carlaIndianSceneTrafficStep(sceneState, cfg, trafficState)
+function trafficState = carlaIndianSceneTrafficStep(sceneState, cfg, trafficState, egoPosXY)
+% Phase 14 addition (optional 4th argument, backward compatible - every
+% existing caller that omits it gets EXACTLY the prior behavior):
+% egoPosXY, when given, is the ego's current [x, y] (this project's
+% frame). See the SAFETY_BUFFER_M block below for why this was added -
+% it is a hard-contact-prevention clamp, not a redesign of any actor's
+% scripted intent/heading/speed.
 % carlaIndianSceneTrafficStep - Phase 11.5: one tick of scripted,
 % NON-LANE-BASED traffic motion for the Indian hero scene. Never CARLA
 % autopilot, never Traffic Manager - every actor's velocity is set
@@ -46,6 +52,40 @@ SPEED_MPS = struct('straight_through', 5.0, 'slow_through', 2.5, 'roadside_edge'
     'turn_left', 4.0, 'turn_right', 4.0, 'informal_merge', 3.5, 'following_ego_lane', 5.5);
 TURN_ANGLE_DEG = struct('turn_left', 85, 'turn_right', -85, 'informal_merge', 40);
 
+% Phase 14 fix (found live, root-caused with a collision sensor - the
+% first time any phase has checked for REAL physical contacts, not just
+% the ego's own predicted/geometric collisionCheck.m flag): every
+% scripted actor here is velocity-commanded with ZERO awareness of the
+% ego's position - by design, since the ego is supposed to be the one
+% doing the avoiding. That is fine while both keep moving, but when the
+% ego correctly comes to a stop (e.g. emergency_stop for a genuine
+% hazard), an actor whose scripted path continues straight toward the
+% ego's now-stationary position has nothing stopping it from physically
+% driving INTO the ego - measured live: a "following_ego_lane" actor
+% (5.5 m/s, sharing the ego's own lane) rammed a correctly-stopped ego
+% with 17 collision-sensor events in two ticks, one impulse peaking at
+% 6836 (CARLA's own units) - a genuine physical contact, not a
+% measurement artifact (confirmed by the ego's speed jumping from a
+% commanded 0 m/s to 2.94 m/s with throttle still at 0.00). This is a
+% property of the SCENE's traffic script, not a defect in the ego's own
+% perception/tracking/prediction/decision/planning/collision-checking/
+% control chain - none of those layers can prevent a DIFFERENT actor
+% from driving into a stationary ego.
+%
+% Fix: a hard, deterministic proximity clamp, applied ONLY when egoPosXY
+% is supplied - if a scripted actor is within SAFETY_BUFFER_M of the ego
+% AND its own commanded heading is closing that distance, it holds
+% (zero velocity) for that tick instead. This changes nothing about any
+% actor's intent, heading, per-intent speed, or turn-trigger geometry
+% when the ego is not in its immediate path - it only ever prevents the
+% specific failure mode of driving through the ego's own occupied space,
+% exactly like a standard NPC-traffic "don't drive through the other
+% car" safety net, not a redesign of the scripted scenario.
+SAFETY_BUFFER_M = 5.0; % center-to-center; real vehicle bodies are ~2m wide/~4.5m long, so this leaves genuine body clearance, not just a point-distance margin
+if nargin < 4
+    egoPosXY = [];
+end
+
 if isempty(trafficState) || ~isstruct(trafficState)
     trafficState = struct('turned', false(1, numel(cfg.trafficActors)));
 end
@@ -77,6 +117,45 @@ for i = 1:numel(cfg.trafficActors)
 
     vx = speed * cos(headingRad);
     vy = speed * sin(headingRad);
+
+    if ~isempty(egoPosXY)
+        if isfield(TURN_ANGLE_DEG, intent)
+            actorRaw = raw; % already queried above for the turn-trigger check
+        else
+            actorRaw = carlaGetActorState(id);
+        end
+        % actorRaw.location is CARLA's raw (left-handed) frame; egoPosXY
+        % is this project's (right-handed) frame - must convert before
+        % comparing, using the SAME verified conversion every other
+        % CARLA-derived position in this codebase uses. Mixing the two
+        % frames directly here would silently reproduce the exact class
+        % of bug Phase 13 found and fixed for the perception pipeline.
+        [actorProjX, actorProjY] = carlaCoordToProject(actorRaw.location.x, actorRaw.location.y);
+        toEgo = egoPosXY - [actorProjX, actorProjY];
+        distToEgo = norm(toEgo);
+        % Widened from a "hold only if closing" check (Phase 14, first
+        % attempt) to an unconditional hold whenever within the buffer,
+        % after live evidence showed it was insufficient: an offline
+        % geometric check of "following_ego_lane" actors (explicitly
+        % designed to share the ego's own lane - closely following/
+        % overtaking, per this file's own docstring) against the Phase 14
+        % turn path found one such actor's SPAWN POINT only 0.01m from
+        % the planned route, and a live run with the closing-only clamp
+        % still recorded 2179 real collision-sensor events over one
+        % approach->turn->exit maneuver. A side-by-side or overtaking
+        % pass can have near-zero longitudinal closing speed while still
+        % being far too close laterally for two real vehicle bodies to
+        % occupy - the closing-speed test cannot see that case. Holding
+        % unconditionally whenever within SAFETY_BUFFER_M is simpler and
+        % safe: it costs the SAME scripted actor a few ticks of paused
+        % motion only when it is already within a couple of vehicle
+        % lengths of the ego, changing nothing else about its intent/
+        % heading/speed/turn-trigger geometry.
+        if distToEgo < SAFETY_BUFFER_M
+            vx = 0; vy = 0; % hold - see the Phase 14 header block above
+        end
+    end
+
     carlaSetActorTargetVelocity(id, vx, vy, 0.0);
 end
 

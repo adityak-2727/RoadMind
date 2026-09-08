@@ -153,6 +153,36 @@ classdef CarlaSession < handle
             detections.timestamp = s.timestamp_s;
         end
 
+        function sensorId = attachCollisionSensor(obj)
+            % Phase 14: authoritative ground-truth collision events from
+            % CARLA's own physics engine - see carla_adapter.py's
+            % attach_collision_sensor()/get_collision_events() docstrings
+            % for why this is a NECESSARY complement to collisionCheck.m's
+            % predicted/geometric evaluation, not a duplicate of it.
+            obj.assertConnected();
+            sensorId = double(obj.PyAdapter.attach_collision_sensor());
+        end
+
+        function events = getCollisionEvents(obj)
+            % Returns a struct array (0x0 if zero collisions since
+            % attachCollisionSensor() was called), one entry per real
+            % physical contact: .frame, .timestamp, .otherActorId,
+            % .otherActorType, .impulseMagnitude.
+            obj.assertConnected();
+            pyList = cell(obj.PyAdapter.get_collision_events());
+            n = numel(pyList);
+            events = repmat(struct('frame', 0, 'timestamp', 0, 'otherActorId', 0, ...
+                'otherActorType', "", 'impulseMagnitude', 0), 1, n);
+            for i = 1:n
+                d = CarlaSession.pyDictToStruct(pyList{i});
+                events(i).frame = d.frame;
+                events(i).timestamp = d.timestamp_s;
+                events(i).otherActorId = d.other_actor_id;
+                events(i).otherActorType = string(d.other_actor_type);
+                events(i).impulseMagnitude = d.impulse_magnitude;
+            end
+        end
+
         function objects = getNearbyActorObjects(obj, rangeM)
             % Simulator-grounded actor metadata (CARLA's own ground truth
             % of nearby vehicle/pedestrian actors) - NOT an image-based

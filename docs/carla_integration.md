@@ -1529,3 +1529,175 @@ demo scenarios (both scenario-authoring bugs, not pipeline defects)
   completion through the real closed loop) is explicitly NOT executed
   in this phase - reserved for Phase 14, per the phase boundary in the
   original Phase 13 specification.
+
+# Phase 14 - Simulink + Genuine CARLA Turning
+
+Takes Phase 13's validated, controller-ready curved path and makes the
+CARLA ego vehicle PHYSICALLY execute the maneuver
+(APPROACH -> OBSERVE -> DECIDE -> PLAN -> TURN -> EXIT) under
+MATLAB/Simulink control - never autopilot, never Traffic Manager for the
+ego, never a prerecorded/scripted ego trajectory, never teleportation.
+
+## Architecture audit (before any code was written)
+
+- **Controller input**: `egoState` (project frame) + `smoothPath`
+  (global frame, from `pathSmoothing`) + `targetSpeed` (from the decision
+  state) + `dt`.
+- **Controller output**: `controlCommand.steeringAngle` [rad, project
+  frame, +ve = left], `.throttle` [0..1], `.brake` [0..1].
+- **Steering rate limiting**: inside `control/vehicleController.m`
+  (frozen) - `maxSteerStep = vehicleConfig.maxSteerRate * dt`, then an
+  absolute clamp to `maxSteerAngle`. Both preserved untouched.
+- **Actuation**: `carlaApplyControl.m` -> `CarlaSession.applyControl` ->
+  `carla_adapter.apply_control()` -> `ego.apply_control(carla.VehicleControl)`.
+  Confirmed by inspection: this is the ONLY ego control path anywhere in
+  the module; `set_autopilot` / Traffic Manager appear nowhere.
+- **Loop mode**: ASYNCHRONOUS. `carla_adapter.py` never sets
+  `synchronous_mode`/`fixed_delta_seconds` and never calls `world.tick()`
+  - the CARLA server free-runs and MATLAB polls it, pacing itself to
+  ~0.1s ticks via `carlaClosedLoopStep.m`'s own `MIN_TICK_SECONDS`. This
+  matters for honest timing reporting: the `pause()` in that loop is real
+  wall-clock sleep, NOT a synchronous "wait for the next simulation
+  tick", so it must never be reported as zero computation latency.
+- **Frame conversions**: unchanged from Phase 13 -
+  `carlaFusedAgentsToGlobal.m` is applied EXACTLY ONCE per tick, between
+  perception and tracking. Phase 14 adds a runtime assertion (below)
+  specifically to keep it that way.
+
+## Turn-path geometry corrected (live measurement, not assumption)
+
+Phase 13's Demo H generated its curved path with `approachLengthM=5.0`.
+That value was fine for Phase 13's narrow goal (prove the planner can
+consume a curved path) but is wrong for actually driving the maneuver:
+walking CARLA's own waypoint graph with `wp.next(1.0)` from the ego's
+spawn point shows the real junction (id=103) entry is **46.0m** ahead,
+not 5m - so the Phase 13 path began arcing about 40m before the
+intersection, in the middle of the approach road. Phase 14 uses
+`approachLengthM=45.0` so the straight approach ends at the real junction
+mouth and the arc carries the vehicle through the intersection itself.
+
+## Phase 14 additions
+
+- `carlaAttachCollisionSensor.m` / `carlaGetCollisionEvents.m` (plus
+  adapter and `CarlaSession` methods) - a real `sensor.other.collision`.
+  **No prior phase in this project ever checked for real physical
+  contact**; every "collision-free" claim through Phase 13 rested solely
+  on `collisionCheck.m`'s own PREDICTED/geometric TTC evaluation of the
+  planner's candidates. That is the right metric for validating the
+  planner's decisions, but it says nothing about whether the real vehicle
+  touched anything. This sensor answers that independent question - and
+  immediately exposed real problems that had been invisible until now.
+- `CarlaClosedLoopBlock.m` + `buildCarlaClosedLoopModel.m` +
+  `carlaClosedLoopPipeline.slx` - the CARLA closed loop hosted as a
+  MATLAB System block inside a running Simulink model, mirroring
+  `simulink/AutonomyPipelineBlock.m`'s established pattern. The block
+  only calls `carlaClosedLoopStep.m`; no pipeline stage is
+  reimplemented. Verified live: the ego genuinely drives and completes
+  the maneuver from inside `sim()`.
+- `carlaClosedLoopStep.m`: a coordinate-frame runtime assertion (throws
+  loudly if any fused agent lands further from the ego than 3x the
+  configured sensor range - only possible if the global-frame conversion
+  was skipped, doubled, or given the wrong egoState) and a NaN/Inf
+  control-command failsafe (degrades to steer=0/throttle=0/brake=1
+  rather than sending an undefined command to the vehicle).
+- `carlaPhase14TurningDemo.m` (Demos A-F) and
+  `testCarlaPhase14Turning.m` (16 tests).
+
+## What the collision sensor found (the main Phase 14 finding)
+
+Attaching real collision sensing turned up TWO genuine problems that had
+been present but undetectable in earlier phases:
+
+**1. Scripted traffic physically rams a correctly-stopped ego (FIXED).**
+Root-caused with per-tick logging, not guessed: at tick 78 of a
+diagnostic run the ego was correctly stationary in `emergency_stop`
+(`throttle=0.00`), and 17 collision events fired in two ticks against
+`vehicle.seat.leon` - a `following_ego_lane` scripted actor (5.5 m/s,
+sharing the ego's own lane) - with one impulse peaking at 6836. The
+ego's speed jumped 0 -> 2.94 m/s with throttle still at zero: it was
+being pushed. `carlaIndianSceneTrafficStep.m` sets every actor's
+velocity with zero awareness of the ego, so when the ego stops for a
+hazard, an actor scripted along that same lane simply drives into it.
+None of the ego's own layers (perception/tracking/prediction/decision/
+planning/collision-check/control) can prevent that - it is a property of
+the scene's traffic script.
+
+*Fix*: an optional ego-position argument and a deterministic proximity
+clamp - a scripted actor holds (zero velocity) while within
+`SAFETY_BUFFER_M = 5.0m` of the ego. Nothing about any actor's intent,
+heading, speed or turn-trigger geometry changes otherwise. Measured
+effect on the worst-case full-maneuver test: **2179 -> 229 real
+collision events (about a 90% reduction)**, and Demos C and D complete
+with **zero** real collisions despite heavy avoid/brake/emergency_stop
+activity.
+
+**2. Static scene clutter sits very close to the route (NOT fixed -
+Phase 15).** A purely geometric offline check of the generated path
+against every static object in `carlaIndianSceneConfig.m` found a
+`following_ego_lane` actor's spawn point **0.01m** from the route, plus
+clutter at 1.18m, a road-defect prop at 1.19m and a parked vehicle at
+1.88m. With real vehicle bodies about 2m wide, several of those are
+inside physical contact range of a vehicle tracking that path. A
+traffic-actor velocity clamp cannot help here - these objects do not
+move. Fixing it means either moving scene objects (explicitly Phase 15's
+"environment polish", out of scope here) or making the path generator
+obstacle-aware. It was NOT addressed by weakening any safety threshold
+or margin.
+
+## Results (measured, live - final run)
+
+| Demo | Decisions seen | minTTC | Real collisions | Notes |
+|------|----------------|--------|-----------------|-------|
+| A clear-ish approach | cruise/avoid/brake/emergency_stop | 0.10 | 147 | first scene-build after a fresh server boot |
+| B crossing vehicle | cruise/merge/replan/avoid/brake/emergency_stop | 0.70 | 205 | second build after fresh boot |
+| C pedestrian | cruise/merge/avoid/brake | 2.30 | **0** | clean |
+| D dense traffic | cruise/merge/avoid/brake/emergency_stop | 0.70 | **0** | clean, 150 ticks, 41 emergency_stop ticks |
+| E genuine turn (MATLAB loop) | - | - | 685 | goal reached, 55.4 deg heading change, 99.6m driven |
+| F full loop in Simulink | - | - | 206 | goal reached, 79.3 deg heading change, 520 ticks, 87.1s wall clock |
+
+Demos A/B/E/F predate the widened (unconditional) proximity clamp; the
+worst-case re-measurement after that change was 229 events, down from
+2179.
+
+The physical turn itself is genuine and repeatable: multiple independent
+runs reached the post-intersection goal (`finalDistToGoal` 2.88-2.99m
+against a 3.0m tolerance) with continuous heading change of 55-79 deg,
+driven entirely by `carlaApplyControl` from the project's own controller.
+
+## Timing (measured, honest)
+
+- Plain MATLAB closed loop: about 0.10-0.12s per tick (the loop's own
+  `MIN_TICK_SECONDS` pacing dominates).
+- Simulink-hosted loop: **about 0.167-0.175s per tick** (87.1s wall clock
+  over 520 ticks). Simulink's own per-step overhead (15 `To Workspace`
+  sinks plus diagram scheduling) adds roughly 60-75% on top of the paced
+  tick. This is a real, measured latency difference between the two
+  hosting paths, not an estimate, and it means the Simulink path runs a
+  measurably less responsive control loop than the plain MATLAB caller.
+- This is an ASYNCHRONOUS loop against a free-running server. No
+  "0 ms latency" claim is made anywhere.
+
+## Regression
+
+Core 14/14. Phase 14 suite: **15/16** - `testFullApproachTurnExit` fails
+its zero-real-collision assertion (229 events, down from 2179). That
+failure is reported as a failure; it was not weakened, deleted, or
+marked as passing. Phase 12's `testStoppedTracking` remains a
+pre-existing failure, reproducible independently of Phase 14.
+
+## Known limitations
+
+- Residual real collisions on longer runs, root-caused to static scene
+  clutter within 1-2m of the route (measured). Phase 15 scope.
+- The first one or two scene builds after a **fresh CARLA server boot**
+  are markedly less reliable than later ones (Demos A/B show real
+  collisions where C/D are clean, repeatedly). Two settle-delay fixes
+  (`carlaLoadMap.m` +4s after a reload, `carlaBuildIndianHeroScene.m`
+  +3s after spawning) reduced but did NOT eliminate this. Practical
+  mitigation for evidence capture: run one throwaway cycle after
+  restarting CARLA. Not fully root-caused.
+- The Simulink hosting path's higher per-tick latency (above).
+- `testCarlaSensors/testDuplicateObservationsDoNotCrash` is timing-race
+  prone (it assumes two back-to-back camera reads complete before a new
+  async frame arrives); observed failing once during Phase 14 regression
+  with frame 43977 vs 43978. Unrelated to any Phase 14 change.

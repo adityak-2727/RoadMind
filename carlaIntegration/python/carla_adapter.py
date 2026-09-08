@@ -89,6 +89,9 @@ class CarlaAdapter:
         self._radar = None
         self._radar_latest = None
 
+        self._collision_sensor = None
+        self._collision_events = []  # accumulated for the vehicle's lifetime - Phase 14 ground-truth collision log
+
         self._other_actors = {}  # actor_id -> carla.Actor, for the Phase 10 validation scene / coordinate checks
 
     # ------------------------------------------------------------------
@@ -453,6 +456,57 @@ class CarlaAdapter:
             "frame": measurement.frame,
             "timestamp_s": measurement.timestamp,
         }
+
+    # ------------------------------------------------------------------
+    # Phase 14: sensor.other.collision - AUTHORITATIVE ground-truth
+    # collision events from CARLA's own physics engine. Added because
+    # every prior phase's "collision-free" claims relied entirely on
+    # collisionCheck.m's own PREDICTED/geometric TTC evaluation of the
+    # planner's candidate trajectories, never on an actual physics contact
+    # event - correct for validating the planner's decision logic, but not
+    # sufficient on its own for claiming the real CARLA vehicle never
+    # physically touched anything. This sensor answers that second,
+    # independent question.
+    # ------------------------------------------------------------------
+    def attach_collision_sensor(self):
+        """Spawns and attaches one sensor.other.collision to the ego
+        vehicle. Every collision event for the vehicle's remaining
+        lifetime is appended to an internal list (fires once per contact,
+        including ongoing scrapes - CARLA's own documented behavior),
+        readable via get_collision_events()."""
+        if self._ego_vehicle is None:
+            raise CarlaAdapterError("attach_collision_sensor() called before spawn_ego_vehicle().")
+
+        bp_lib = self._world.get_blueprint_library()
+        bp = bp_lib.find('sensor.other.collision')
+        transform = self._carla.Transform()  # collision sensor has no meaningful mount offset
+        sensor = self._world.spawn_actor(bp, transform, attach_to=self._ego_vehicle)
+        self._collision_sensor = sensor
+        self._collision_events = []
+        sensor.listen(self._on_collision)
+        return sensor.id
+
+    def _on_collision(self, event):
+        other = event.other_actor
+        impulse = event.normal_impulse
+        self._collision_events.append({
+            "frame": event.frame,
+            "timestamp_s": event.timestamp,
+            "other_actor_id": other.id if other is not None else -1,
+            "other_actor_type": other.type_id if other is not None else "unknown",
+            "impulse_magnitude": float((impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2) ** 0.5),
+        })
+
+    def get_collision_events(self) -> list:
+        """Returns every collision event recorded since attach_collision_sensor()
+        was called, as a list of dicts (frame, timestamp_s, other_actor_id,
+        other_actor_type, impulse_magnitude). Empty list means zero
+        physical contacts, not "sensor not attached" - raises if the
+        sensor was never attached, so a caller cannot silently mistake
+        "never checked" for "checked and clean"."""
+        if self._collision_sensor is None:
+            raise CarlaAdapterError("get_collision_events() called before attach_collision_sensor().")
+        return list(self._collision_events)
 
     # ------------------------------------------------------------------
     # Phase 10: simulator-grounded actor/object metadata (NOT an
@@ -901,12 +955,14 @@ class CarlaAdapter:
             self._ego_vehicle = None
 
     def destroy_sensors(self):
-        """Stops and destroys camera/LiDAR/radar if attached. Safe to call
-        even if none were ever attached, and safe to call more than once."""
+        """Stops and destroys camera/LiDAR/radar/collision if attached.
+        Safe to call even if none were ever attached, and safe to call
+        more than once."""
         for attr_sensor, attr_latest in (
             ('_camera', '_camera_latest'),
             ('_lidar', '_lidar_latest'),
             ('_radar', '_radar_latest'),
+            ('_collision_sensor', '_collision_events'),
         ):
             sensor = getattr(self, attr_sensor)
             if sensor is not None:

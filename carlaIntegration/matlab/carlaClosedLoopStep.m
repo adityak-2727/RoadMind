@@ -120,6 +120,37 @@ if ~isempty(obs.egoState)
     fusedAgents = carlaFusedAgentsToGlobal(fusedAgents, obs.egoState);
 end
 
+% --- Phase 14 mandatory frame-safety assertion: fail LOUDLY rather than
+% silently mix frames again. carlaFusedAgentsToGlobal.m above is applied
+% exactly ONCE per tick, and only here - no other call site in this file
+% touches fusedAgents' frame. As a runtime invariant check (not a second
+% conversion), every agent's GLOBAL position must lie within a bounded
+% multiple of the sensor's own configured range of the ego's GLOBAL
+% position; a violation can only mean the conversion was skipped, applied
+% twice, or applied with the wrong egoState - exactly the class of defect
+% Phase 13 found. This never fires in normal operation (sensor-range
+% filtering inside carlaPerceptionStep.m already bounds ego-relative
+% distance to maxSensorRangeMeters before the conversion), so a firing
+% here is treated as a hard integration defect, not a degraded-sensor
+% case - it throws rather than silently skipping the tick.
+if ~isempty(obs.egoState) && ~isempty(fusedAgents)
+    FRAME_ASSERT_MARGIN = 3.0; % generous multiple, not a tight tolerance - this guards against gross frame errors (~doubling/omission), not normal sensor noise
+    egoPosCheck = [obs.egoState.x, obs.egoState.y];
+    maxAllowedDist = FRAME_ASSERT_MARGIN * loopState.perceptionCfg.maxSensorRangeMeters;
+    for fi = 1:numel(fusedAgents)
+        distFromEgo = norm(fusedAgents(fi).position - egoPosCheck);
+        if distFromEgo > maxAllowedDist
+            error('carlaClosedLoopStep:frameMismatch', ...
+                ['Coordinate-frame invariant violated: fused agent %d is %.1fm from ego ' ...
+                 '(egoPos=[%.2f,%.2f]), exceeding %.1fx the configured sensor range (%.1fm). ' ...
+                 'This indicates carlaFusedAgentsToGlobal.m was skipped, double-applied, or given ' ...
+                 'the wrong egoState - see carlaFusedAgentsToGlobal.m and the Phase 13 frame-bug ' ...
+                 'writeup in docs/carla_integration.md before investigating further.'], ...
+                fi, distFromEgo, egoPosCheck(1), egoPosCheck(2), FRAME_ASSERT_MARGIN, loopState.perceptionCfg.maxSensorRangeMeters);
+        end
+    end
+end
+
 report = struct('tickCount', loopState.tickCount, 'dt', dt, 'obs', obs, 'fusedAgents', fusedAgents);
 
 if isempty(obs.egoState)
@@ -189,6 +220,25 @@ usedFallback = feasibleCount == 0 && nCandidates > 0;
 
 % --- 7. Control (UNMODIFIED) ---
 controlCommand = vehicleController(egoState, smoothPath, loopState.vehCfg, targetSpeed, dt);
+
+% --- Phase 14 failsafe: a NaN/Inf control command must never reach CARLA
+% actuation. This is a pure integration-layer guard (vehicleController.m
+% itself is untouched) - if its output is ever invalid for any reason
+% (e.g. a NaN propagating from an edge-case upstream), degrade to a
+% controlled stop (steer centered, throttle off, full brake) rather than
+% sending an undefined command to the vehicle, matching the project's
+% "prefer controlled braking over uncontrolled motion" failsafe rule.
+% loopState.lastSteeringAngle intentionally still latches the SAFE value
+% below, not the invalid one, so next tick's rate-limiter is not fed NaN.
+isCommandInvalid = ~isfinite(controlCommand.steeringAngle) || ~isfinite(controlCommand.throttle) || ~isfinite(controlCommand.brake);
+if isCommandInvalid
+    warning('carlaClosedLoopStep:invalidControlCommand', ...
+        'vehicleController produced a non-finite command (steer=%g throttle=%g brake=%g) at tick %d - applying a controlled stop instead.', ...
+        controlCommand.steeringAngle, controlCommand.throttle, controlCommand.brake, loopState.tickCount);
+    controlCommand.steeringAngle = 0;
+    controlCommand.throttle = 0;
+    controlCommand.brake = 1;
+end
 loopState.lastSteeringAngle = controlCommand.steeringAngle;
 
 % --- 8. Apply to the REAL CARLA ego - never autopilot, never a scripted trajectory ---
@@ -226,5 +276,8 @@ report.candidateColliding      = candidateColliding;
 report.usedFallback            = usedFallback;
 report.selectedCandidateIndex  = loopState.previousCandidateIndex;
 report.candidateChanged        = ~isequal(loopState.previousCandidateIndex, priorIdx);
+
+% --- Phase 14 addition ---
+report.commandOverridden       = isCommandInvalid;
 
 end

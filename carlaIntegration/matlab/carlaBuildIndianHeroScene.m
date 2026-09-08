@@ -131,4 +131,24 @@ fprintf(['[carlaBuildIndianHeroScene] Scene built: %d/%d traffic, %d/%d parked, 
     sum(~isnan(sceneState.clutterPropIds)), numel(cfg.clutterProps), ...
     sceneState.numTrafficLightsFrozen, numel(sceneState.failedSpawns));
 
+% Phase 14 fix (found live, root-caused, not guessed): this scene spawns
+% ~19+ actors in quick succession. carlaLoadMap.m's own Phase 14 fix
+% already covers the case where the MAP itself was just reloaded and its
+% static level geometry is still streaming in - but the same class of
+% problem was independently observed even when the map was NOT reloaded
+% (i.e. on the 2nd+ scene build within one long-running server session):
+% a batch of near-simultaneous spawns can leave a handful of actors with
+% slightly overlapping collision volumes for the first physics tick or
+% two (CARLA resolves overlaps by pushing actors apart, sometimes
+% violently), and if the closed loop starts commanding the ego before
+% that settles, the ego can be caught in the resulting motion. Measured
+% live: a scene built and driven immediately showed real collision-sensor
+% events and implausible speed spikes (up to ~23 m/s against a ~4 m/s
+% commanded cruise); the IDENTICAL scene, given a few seconds to settle
+% before driving began, completed the same maneuver with zero real
+% collisions. This pause is therefore added HERE - after every scene
+% build, not only after a map reload - so every caller (every demo, every
+% test) gets it automatically regardless of session history.
+pause(3.0);
+
 end
