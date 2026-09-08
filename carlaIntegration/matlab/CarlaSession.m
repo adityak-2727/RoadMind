@@ -225,6 +225,17 @@ classdef CarlaSession < handle
             end
         end
 
+        function setSpectatorTransform(obj, x, y, z, pitchDeg, yawDeg, rollDeg)
+            % EMERGENCY DEMO BRIDGE: points CARLA's free-fly spectator
+            % camera at an explicit world transform so the evaluator's
+            % CARLA window shows the scene being driven, not wherever the
+            % camera defaulted to. Moves only the spectator, no actor.
+            obj.assertConnected();
+            obj.PyAdapter.set_spectator_transform(pyargs( ...
+                'x', x, 'y', y, 'z', z, ...
+                'pitch_deg', pitchDeg, 'yaw_deg', yawDeg, 'roll_deg', rollDeg));
+        end
+
         function n = getCollisionCount(obj)
             % Cheap collision-event count (an int, not the whole list) -
             % safe to poll every tick. See carla_adapter.py's

@@ -872,6 +872,20 @@ class CarlaAdapter:
             "timestamp_s": snapshot.timestamp.elapsed_seconds,
         }
 
+    def set_spectator_transform(self, x: float, y: float, z: float, pitch_deg: float, yaw_deg: float, roll_deg: float) -> None:
+        """EMERGENCY DEMO BRIDGE: points CARLA's free-fly spectator camera
+        at an explicit world transform, so the evaluator's CARLA window
+        shows the intersection instead of wherever the camera happened to
+        default to. Read-only w.r.t. simulation state - moves only the
+        spectator, never any actor."""
+        if self._world is None:
+            raise CarlaAdapterError("set_spectator_transform() called before connect().")
+        transform = self._carla.Transform(
+            self._carla.Location(x=x, y=y, z=z),
+            self._carla.Rotation(pitch=pitch_deg, yaw=yaw_deg, roll=roll_deg),
+        )
+        self._world.get_spectator().set_transform(transform)
+
     # ------------------------------------------------------------------
     # Phase 11.5: absolute-world-transform spawning, for the Indian hero
     # scene. spawn_actor_relative_to_ego() (above) positions an actor
