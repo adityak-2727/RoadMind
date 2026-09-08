@@ -1,4 +1,4 @@
-function trafficState = carlaIndianSceneTrafficStep(sceneState, cfg, trafficState, egoPosXY)
+function trafficState = carlaIndianSceneTrafficStep(sceneState, cfg, trafficState, egoPosXY, collisionActorIds)
 % Phase 14 addition (optional 4th argument, backward compatible - every
 % existing caller that omits it gets EXACTLY the prior behavior):
 % egoPosXY, when given, is the ego's current [x, y] (this project's
@@ -42,6 +42,11 @@ function trafficState = carlaIndianSceneTrafficStep(sceneState, cfg, trafficStat
 %   cfg          - from config/carlaIndianSceneConfig.m
 %   trafficState - [] on the first call; the previous call's returned
 %                  trafficState on every call after
+%   collisionActorIds - optional numeric actor IDs from collision events
+%                  observed since the preceding traffic tick. This is
+%                  diagnostic-only in Phase 14.12: it records which
+%                  scripted actor contacted the ego but does not alter
+%                  traffic behavior.
 % Output:
 %   trafficState - struct with .turned (logical array, one per traffic
 %                  actor, whether its turn/merge transition has already
@@ -108,13 +113,34 @@ TURN_ANGLE_DEG = struct('turn_left', 85, 'turn_right', -85, 'informal_merge', 40
 % configuration, NOT as a known-correct one - residual contacts remain and
 % are reported honestly rather than tuned away.
 SAFETY_BUFFER_M = 5.0;
+RECOVERY_RELEASE_DISTANCE_M = 5.5; % 0.5 m hysteresis beyond the existing 5 m clamp
+MAX_RECOVERY_TICKS = 50; % bounded ~5 s at the loop's nominal 0.1 s cadence
 if nargin < 4
     egoPosXY = [];
 end
+if nargin < 5 || isempty(collisionActorIds)
+    collisionActorIds = [];
+end
 
 if isempty(trafficState) || ~isstruct(trafficState)
-    trafficState = struct('turned', false(1, numel(cfg.trafficActors)));
+    nTraffic = numel(cfg.trafficActors);
+    trafficState = struct( ...
+        'turned', false(1, nTraffic), ...
+        'recoveryActive', false(1, nTraffic), ...
+        'recoveryTimedOut', false(1, nTraffic), ...
+        'recoveryTicks', zeros(1, nTraffic), ...
+        'recoveryActivationCount', zeros(1, nTraffic), ...
+        'recoveryTimeoutCount', zeros(1, nTraffic));
 end
+if ~isfield(trafficState, 'recoveryActive')
+    nTraffic = numel(cfg.trafficActors);
+    trafficState.recoveryActive = false(1, nTraffic);
+    trafficState.recoveryTimedOut = false(1, nTraffic);
+    trafficState.recoveryTicks = zeros(1, nTraffic);
+    trafficState.recoveryActivationCount = zeros(1, nTraffic);
+    trafficState.recoveryTimeoutCount = zeros(1, nTraffic);
+end
+trafficState.diagnostics = repmat(makeTrafficDiagnostic(), 1, numel(cfg.trafficActors));
 
 center = cfg.junctionCenter;
 
@@ -126,6 +152,12 @@ for i = 1:numel(cfg.trafficActors)
     a = cfg.trafficActors(i);
     intent = char(a.intent);
     speed = SPEED_MPS.(intent);
+    newCollisionEvent = any(collisionActorIds == id);
+    if newCollisionEvent && ~trafficState.recoveryActive(i) && ~trafficState.recoveryTimedOut(i)
+        trafficState.recoveryActive(i) = true;
+        trafficState.recoveryTicks(i) = 0;
+        trafficState.recoveryActivationCount(i) = trafficState.recoveryActivationCount(i) + 1;
+    end
 
     baseHeadingRad = deg2rad(a.yawDeg);
     headingRad = baseHeadingRad;
@@ -141,8 +173,13 @@ for i = 1:numel(cfg.trafficActors)
         end
     end
 
-    vx = speed * cos(headingRad);
-    vy = speed * sin(headingRad);
+    originalVx = speed * cos(headingRad);
+    originalVy = speed * sin(headingRad);
+    vx = originalVx;
+    vy = originalVy;
+    actorRaw = [];
+    distToEgo = NaN;
+    clampActive = false;
 
     if ~isempty(egoPosXY)
         if isfield(TURN_ANGLE_DEG, intent)
@@ -179,12 +216,55 @@ for i = 1:numel(cfg.trafficActors)
         % motion only when it is already within a couple of vehicle
         % lengths of the ego, changing nothing else about its intent/
         % heading/speed/turn-trigger geometry.
-        if distToEgo < clampDist
+        % CONTACT_RECOVERY is deliberately actor-specific: only a CARLA
+        % collision event naming this actor can enter it. While active, the
+        % original scripted velocity above is retained so CARLA physics can
+        % separate the bodies naturally. No displacement, impulse, route
+        % change, autopilot, or ego-control override is introduced.
+        if trafficState.recoveryActive(i)
+            trafficState.recoveryTicks(i) = trafficState.recoveryTicks(i) + 1;
+            if distToEgo >= RECOVERY_RELEASE_DISTANCE_M
+                trafficState.recoveryActive(i) = false;
+                trafficState.recoveryTicks(i) = 0;
+            elseif trafficState.recoveryTicks(i) > MAX_RECOVERY_TICKS
+                trafficState.recoveryActive(i) = false;
+                trafficState.recoveryTimedOut(i) = true;
+                trafficState.recoveryTimeoutCount(i) = trafficState.recoveryTimeoutCount(i) + 1;
+            end
+        elseif trafficState.recoveryTimedOut(i) && distToEgo >= RECOVERY_RELEASE_DISTANCE_M
+            % A timed-out actor may become eligible for a future, distinct
+            % contact only after it has physically separated.
+            trafficState.recoveryTimedOut(i) = false;
+        end
+
+        if distToEgo < clampDist && ~trafficState.recoveryActive(i)
             vx = 0; vy = 0; % hold - see the Phase 14/14.5 header blocks above
+            clampActive = true;
         end
     end
 
     carlaSetActorTargetVelocity(id, vx, vy, 0.0);
+    diag = makeTrafficDiagnostic();
+    diag.actorId = id;
+    diag.blueprint = string(a.blueprint);
+    diag.intent = string(a.intent);
+    diag.distanceToEgo = distToEgo;
+    diag.originalTargetVelocity = [originalVx, originalVy];
+    diag.appliedTargetVelocity = [vx, vy];
+    diag.clampActive = clampActive;
+    diag.newCollisionEvent = newCollisionEvent;
+    if ~isempty(actorRaw)
+        diag.actualVelocity = [actorRaw.velocity_mps.x, actorRaw.velocity_mps.y];
+    end
+    if trafficState.recoveryActive(i)
+        diag.recoveryState = "contact_recovery";
+    elseif trafficState.recoveryTimedOut(i)
+        diag.recoveryState = "recovery_timeout";
+    end
+    diag.recoveryTicks = trafficState.recoveryTicks(i);
+    diag.recoveryActivationCount = trafficState.recoveryActivationCount(i);
+    diag.recoveryTimeoutCount = trafficState.recoveryTimeoutCount(i);
+    trafficState.diagnostics(i) = diag;
 end
 
 for i = 1:numel(cfg.pedestrians)
@@ -194,6 +274,18 @@ for i = 1:numel(cfg.pedestrians)
     end
     ped = cfg.pedestrians(i);
     carlaSetActorTargetVelocity(id, ped.velocityCarla(1), ped.velocityCarla(2), 0.0);
+end
+
+function diag = makeTrafficDiagnostic()
+% Compact per-actor diagnostic record. It is deliberately derived from the
+% state query already required for the proximity clamp; no callback or
+% world-wide query is introduced by Phase 14.12 instrumentation.
+diag = struct('actorId', NaN, 'blueprint', "", 'intent', "", ...
+    'distanceToEgo', NaN, 'originalTargetVelocity', [NaN, NaN], ...
+    'appliedTargetVelocity', [NaN, NaN], 'actualVelocity', [NaN, NaN], ...
+    'clampActive', false, 'newCollisionEvent', false, ...
+    'recoveryState', "normal", 'recoveryTicks', 0, ...
+    'recoveryActivationCount', 0, 'recoveryTimeoutCount', 0);
 end
 
 end
