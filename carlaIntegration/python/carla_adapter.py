@@ -564,6 +564,20 @@ class CarlaAdapter:
             raise CarlaAdapterError("get_collision_count() called before attach_collision_sensor().")
         return len(self._collision_events)
 
+    def get_new_collision_events(self, since_index: int) -> list:
+        """Phase 14.11: returns only events at index >= since_index (a plain
+        Python list slice, O(k) in the number of NEW events, not O(n) in the
+        total so far). Exists so a caller can log every event's actor id/
+        impulse/pose as it happens without re-marshalling the whole,
+        ever-growing list each tick - get_collision_events() does that, and
+        Phase 14.5 measured polling it every tick to crawl a run to a halt
+        once the count reached the thousands. Pass the count returned by the
+        LAST call (or 0 initially) as since_index; the return value's length
+        tells the caller the new current count."""
+        if self._collision_sensor is None:
+            raise CarlaAdapterError("get_new_collision_events() called before attach_collision_sensor().")
+        return self._collision_events[int(since_index):]
+
     def resolve_actor_snapshot(self, actor_id: int) -> dict:
         """Looks up one actor's CURRENT location/extent by id, for
         post-run collision forensics. Called AFTER a run, never from
