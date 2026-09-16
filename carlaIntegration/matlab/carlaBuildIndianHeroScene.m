@@ -60,6 +60,9 @@ sceneState.failedSpawns = repmat(struct('kind', "", 'index', 0, 'blueprint', "")
 sceneState.egoId = carlaSpawnEgoVehicleAtTransform(cfg.egoBlueprint, ...
     cfg.egoApproach.x, cfg.egoApproach.y, cfg.egoApproach.z, cfg.egoApproach.yawDeg);
 fprintf('[carlaBuildIndianHeroScene] Ego spawned, id=%d, approach=%s\n', sceneState.egoId, cfg.egoApproach.approach);
+if isfield(cfg, 'captureSpawnCollisions') && cfg.captureSpawnCollisions
+    carlaAttachCollisionSensor(); % capture scene settling contacts too
+end
 
 sceneState.trafficActorIds = nan(1, numel(cfg.trafficActors));
 for i = 1:numel(cfg.trafficActors)

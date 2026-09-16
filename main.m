@@ -68,6 +68,21 @@ scenario = selectScenarioByName(scenarioNameOverride);
 %% Initialize state
 egoState = scenario.egoStart;
 groundTruthAgents = scenario.agents; % world truth; perception/*.m only ever sees a degraded view of this
+
+% Active traffic light, urbanIntersection only (see scenarios/urbanIntersection.m's
+% header for why this is safe: it gates the SCRIPTED ground-truth motion
+% of the cross-street vehicles below, never the ego - the ego still only
+% ever reacts to perceived agent motion via its existing perception/
+% prediction/TTC pipeline, exactly as before. behaviorDecision.m/
+% decisionStateMachine.m are untouched and never read this state; the
+% ego has no way to "know" a light exists, it just observes that certain
+% agents are or aren't moving, same as any other tracked behavior.
+LIGHT_PERIOD_S = 2.0; % "start stop in 2s" - red for 2s, green for 2s, repeating
+LIGHT_CONTROLLED_IDS = [1, 2, 5]; % crossCar, crossMotorcycle, secondCrossCar - the lane-based cross-street traffic on the light's side. crossingPedestrian/mergingAutoRickshaw/oncomingCar/weavingCyclist are NOT gated (informal/pedestrian movement or on the ego's own road, not "that side").
+nominalAgentVelocities = containers.Map('KeyType', 'double', 'ValueType', 'any');
+for a = 1:numel(groundTruthAgents)
+    nominalAgentVelocities(double(groundTruthAgents(a).id)) = groundTruthAgents(a).velocity;
+end
 trackedAgentsPrev = repmat(createAgent(), 0, 0);
 decisionState = "cruise";
 goalTolerance = 2.0; % [m]
@@ -131,6 +146,23 @@ PLAYBACK_RATE = 1.0;
 
 if simCfg.realTimePlot
     renderer = RealtimeRenderer(PLAYBACK_RATE);
+    if isfield(scenario.map, 'width')
+        renderer.drawRoadWidth(globalPath, scenario.map.width);
+    end
+    if strcmp(scenario.name, "urbanIntersection")
+        % urbanIntersection is a genuine 4-way crossing, not a single
+        % road: scenarios/urbanIntersection.m's own crossCar (y=0) and
+        % crossMotorcycle (y=4) travel along a perpendicular east-west
+        % street through the same junction the ego's north-south road
+        % passes through. Only the ego's own road has a scenario-defined
+        % width (scenario.map.width, drawn above) - the cross-street's
+        % width is not part of the scenario data, so 6.0m (matching the
+        % ego road) is used here purely for a readable, honestly-
+        % approximate visual, not a value read from any scenario file.
+        crossStreetCenterline = [-40, 2; 40, 2]; % spans the crossing agents' x-range, centered between crossCar (y=0) and crossMotorcycle (y=4)
+        renderer.drawRoadWidth(crossStreetCenterline, 6.0);
+        renderer.drawTrafficLight(4.5, 4.5); % junction corner, clear of both road bands (N-S: |x|<=3, E-W: -1<=y<=5) - decorative only, see urbanIntersection.m's header note
+    end
 end
 
 % Per-step + summary logs to results/logs/, gated by simCfg.logToFile, so
@@ -276,8 +308,17 @@ for t = 1:steps
     egoHistory(t, :) = [egoState.x, egoState.y];
 
     % --- Ground-truth agent motion (perception above only observes a degraded view of this) ---
+    isRedLight = strcmp(scenario.name, "urbanIntersection") && ...
+        mod(floor(egoState.timestamp / LIGHT_PERIOD_S), 2) == 0;
     stepMinClearance = Inf;
     for a = 1:numel(groundTruthAgents)
+        if strcmp(scenario.name, "urbanIntersection") && ismember(groundTruthAgents(a).id, LIGHT_CONTROLLED_IDS)
+            if isRedLight
+                groundTruthAgents(a).velocity = [0, 0]; % stopped at red
+            else
+                groundTruthAgents(a).velocity = nominalAgentVelocities(double(groundTruthAgents(a).id)); % resumes its scripted cruise velocity at green
+            end
+        end
         groundTruthAgents(a).position = groundTruthAgents(a).position + groundTruthAgents(a).velocity * simCfg.dt;
         groundTruthAgents(a).timestamp = egoState.timestamp;
         d = norm([egoState.x, egoState.y] - groundTruthAgents(a).position);
@@ -308,6 +349,9 @@ for t = 1:steps
     % by the renderer is ever read back into the simulation.
     if simCfg.realTimePlot
         renderer.update(egoState, trackedAgents, predictedTrajectories, smoothPath, decisionState, targetSpeed, minTTC, scenario.name);
+        if strcmp(scenario.name, "urbanIntersection")
+            renderer.setTrafficLightState(isRedLight);
+        end
     end
 
     if norm([egoState.x, egoState.y] - scenario.egoGoal) < goalTolerance

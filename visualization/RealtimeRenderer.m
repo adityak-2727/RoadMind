@@ -54,6 +54,7 @@ classdef RealtimeRenderer < handle
         AgentMarkerHandles  = matlab.graphics.chart.primitive.Line.empty
         AgentLabelHandles   = matlab.graphics.Graphics.empty
         PredTrajHandles     = matlab.graphics.chart.primitive.Line.empty
+        TrafficLightLampHandle
 
         HasPrevState = false
         PrevEgoX = 0
@@ -161,6 +162,83 @@ classdef RealtimeRenderer < handle
             end
 
             obj.storePrevState(egoState, trackedAgents);
+        end
+
+        function drawRoadWidth(obj, centerline, width)
+            % One-time, static road-corridor visualization: shades the
+            % scenario's drivable width around its centerline, so the 2D
+            % plot shows the road the ego is meant to stay within instead
+            % of just a bare centerline. Purely a rendering addition -
+            % reads scenario.map.width (already defined by every
+            % scenarios/*.m file) and draws it; does not touch, clamp, or
+            % otherwise constrain the ego's actual computed motion in any
+            % way. Call once, right after construction (or whenever the
+            % scenario's path is known) - the road geometry is static for
+            % the whole run, unlike update()'s per-tick state.
+            if ~ishghandle(obj.Fig) || isempty(centerline) || size(centerline, 1) < 2
+                return;
+            end
+            n = size(centerline, 1);
+            normals = zeros(n, 2);
+            for i = 1:n
+                if i == 1
+                    seg = centerline(2, :) - centerline(1, :);
+                elseif i == n
+                    seg = centerline(n, :) - centerline(n - 1, :);
+                else
+                    seg = centerline(i + 1, :) - centerline(i - 1, :);
+                end
+                segLen = norm(seg);
+                if segLen < 1e-9
+                    normals(i, :) = [0, 0];
+                else
+                    normals(i, :) = [-seg(2), seg(1)] / segLen; % perpendicular unit vector
+                end
+            end
+            halfWidth = width / 2;
+            leftEdge = centerline + halfWidth * normals;
+            rightEdge = centerline - halfWidth * normals;
+
+            roadPatch = patch(obj.Ax, [leftEdge(:, 1); flipud(rightEdge(:, 1))], ...
+                [leftEdge(:, 2); flipud(rightEdge(:, 2))], [0.85, 0.85, 0.85], ...
+                'EdgeColor', 'none', 'FaceAlpha', 0.6);
+            leftLine = plot(obj.Ax, leftEdge(:, 1), leftEdge(:, 2), 'k-', 'LineWidth', 1);
+            rightLine = plot(obj.Ax, rightEdge(:, 1), rightEdge(:, 2), 'k-', 'LineWidth', 1);
+            uistack([roadPatch, leftLine, rightLine], 'bottom'); % road must render behind ego/path/agents regardless of call order
+        end
+
+        function drawTrafficLight(obj, x, y)
+            % Static infrastructure marker - a pole + lamp, drawn once.
+            % The lamp's COLOR now reflects the real light state (set via
+            % setTrafficLightState below), but the marker itself still
+            % carries no logic and is never read by decisionStateMachine.m/
+            % behaviorDecision.m/any other frozen file - only main.m's own
+            % (non-frozen) scenario-orchestration loop knows the light
+            % state, and only to gate the SCRIPTED cross-street agents'
+            % ground-truth velocity. The ego never queries this light; it
+            % only ever perceives the resulting agent motion, exactly as
+            % it perceives any other agent behavior.
+            if ~ishghandle(obj.Fig)
+                return;
+            end
+            plot(obj.Ax, [x, x], [y, y + 2.2], 'k-', 'LineWidth', 2); % pole
+            obj.TrafficLightLampHandle = plot(obj.Ax, x, y + 2.2, 'o', 'MarkerFaceColor', [1, 0.75, 0], ...
+                'MarkerEdgeColor', 'k', 'MarkerSize', 12); % starts amber until the first setTrafficLightState call
+        end
+
+        function setTrafficLightState(obj, isRed)
+            % Updates the lamp drawn by drawTrafficLight to match the
+            % real light state main.m is already using to gate the
+            % cross-street agents' velocity - a visual readout of that
+            % state, not a second source of truth for it.
+            if isempty(obj.TrafficLightLampHandle) || ~ishghandle(obj.TrafficLightLampHandle)
+                return;
+            end
+            if isRed
+                set(obj.TrafficLightLampHandle, 'MarkerFaceColor', [0.85, 0.1, 0.1]);
+            else
+                set(obj.TrafficLightLampHandle, 'MarkerFaceColor', [0.1, 0.7, 0.2]);
+            end
         end
 
         function drawFinalTrace(obj, egoHistory)

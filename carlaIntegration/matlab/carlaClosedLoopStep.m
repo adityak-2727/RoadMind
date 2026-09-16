@@ -100,6 +100,14 @@ loopState.tickCount = loopState.tickCount + 1;
 
 % --- 1/2. Perception + fusion (Phase 11, unmodified) ---
 [fusedAgents, obs] = carlaPerceptionStep(loopState.perceptionCfg, false, loopState.previousFusedAgents);
+if isfield(loopState, 'strictDemo') && loopState.strictDemo
+    try
+        carlaValidateHeroObservation(obs, loopState.perceptionCfg);
+    catch err
+        carlaApplyControl(0, 0, 1);
+        rethrow(err);
+    end
+end
 loopState.previousFusedAgents = fusedAgents;
 
 % --- Phase 13 fix: carlaPerceptionStep.m deliberately returns fusedAgents
@@ -232,6 +240,10 @@ controlCommand = vehicleController(egoState, smoothPath, loopState.vehCfg, targe
 % below, not the invalid one, so next tick's rate-limiter is not fed NaN.
 isCommandInvalid = ~isfinite(controlCommand.steeringAngle) || ~isfinite(controlCommand.throttle) || ~isfinite(controlCommand.brake);
 if isCommandInvalid
+    if isfield(loopState, 'strictDemo') && loopState.strictDemo
+        carlaApplyControl(0, 0, 1);
+        error('Phase15:invalidControl', 'Non-finite controller output at tick %d; stopped.', loopState.tickCount);
+    end
     warning('carlaClosedLoopStep:invalidControlCommand', ...
         'vehicleController produced a non-finite command (steer=%g throttle=%g brake=%g) at tick %d - applying a controlled stop instead.', ...
         controlCommand.steeringAngle, controlCommand.throttle, controlCommand.brake, loopState.tickCount);

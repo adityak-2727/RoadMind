@@ -25,6 +25,13 @@ classdef CarlaSession < handle
     end
 
     methods
+        function supervisor = heroSupervisor(obj)
+            % Phase 15 scene supervisor; never exposes ego actuation.
+            obj.assertConnected();
+            module = py.importlib.import_module('hero_demo');
+            supervisor = module.HeroSupervisor(obj.PyAdapter);
+        end
+
         function connect(obj, cfg)
             if obj.Connected
                 return; % already connected - idempotent, Task 3's "handle connection failures cleanly"
